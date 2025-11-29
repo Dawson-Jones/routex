@@ -1,9 +1,9 @@
 use std::net::IpAddr;
 
 use libc::{
-    in6_addr, in_addr, rt_msghdr, sockaddr, sockaddr_dl, sockaddr_in, sockaddr_in6, AF_INET, AF_INET6, AF_LINK, RTM_VERSION
+    in6_addr, in_addr, rt_msghdr, sockaddr, sockaddr_dl, sockaddr_in, sockaddr_in6, AF_INET,
+    AF_INET6, AF_LINK, RTM_VERSION,
 };
-
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -26,7 +26,11 @@ impl Default for m_rtmsg {
 macro_rules! roundup {
     ($a:expr) => {{
         let size = std::mem::size_of::<u32>();
-        let val = if $a > 0 { 1 + (($a - 1) | (size - 1)) } else { size };
+        let val = if $a > 0 {
+            1 + (($a - 1) | (size - 1))
+        } else {
+            size
+        };
         val
     }};
 }
@@ -50,7 +54,7 @@ impl m_rtmsg {
                 sa_in.sin_family = AF_INET as u8;
                 sa_in.sin_port = 0;
                 sa_in.sin_addr = in_addr {
-                    s_addr: unsafe { std::mem::transmute(addr.octets()) },
+                    s_addr: u32::from_ne_bytes(addr.octets()),
                 };
 
                 self.attr_len += sa_len;
@@ -96,22 +100,24 @@ impl m_rtmsg {
     }
 
     pub fn get_addr(&mut self) -> IpAddr {
-        let sa = unsafe {
-            &*(self.attr[self.attr_len..].as_ptr() as *const sockaddr)
-        };
+        let sa_ptr = self.attr[self.attr_len..].as_ptr() as *const sockaddr;
 
-        if sa.sa_family == AF_INET as u8 {
-            let sa_in: &sockaddr_in = unsafe { std::mem::transmute(sa) };
+        unsafe {
+            if (*sa_ptr).sa_family == AF_INET as u8 {
+                let sa_in_ptr = sa_ptr as *const sockaddr_in;
+                let sa_in = &*sa_in_ptr;
 
-            self.attr_len += roundup!(sa_in.sin_len as usize);
+                self.attr_len += roundup!(sa_in.sin_len as usize);
 
-            return IpAddr::from(sa_in.sin_addr.s_addr.to_ne_bytes());
-        } else {
-            let sa_in6: &sockaddr_in6 = unsafe { std::mem::transmute(sa) };
+                return IpAddr::from(sa_in.sin_addr.s_addr.to_ne_bytes());
+            } else {
+                let sa_in6_ptr = sa_ptr as *const sockaddr_in6;
+                let sa_in6 = &*sa_in6_ptr;
 
-            self.attr_len += roundup!(sa_in6.sin6_len as usize);
+                self.attr_len += roundup!(sa_in6.sin6_len as usize);
 
-            return IpAddr::from(sa_in6.sin6_addr.s6_addr);
+                return IpAddr::from(sa_in6.sin6_addr.s6_addr);
+            }
         }
     }
 
@@ -124,18 +130,14 @@ impl m_rtmsg {
     }
 
     pub fn get_netmask(&mut self, family: u8) -> IpAddr {
-        let sa= unsafe {
-            &mut *(self.attr[self.attr_len..].as_ptr() as *mut sockaddr)
-        };
+        let sa = unsafe { &mut *(self.attr[self.attr_len..].as_ptr() as *mut sockaddr) };
         sa.sa_family = family;
 
         self.get_addr()
     }
 
     pub fn get_index(&mut self) -> u32 {
-        let sa_dl = unsafe {
-            &mut *(self.attr[self.attr_len..].as_ptr() as *mut sockaddr_dl)
-        };
+        let sa_dl = unsafe { &mut *(self.attr[self.attr_len..].as_ptr() as *mut sockaddr_dl) };
         self.attr_len += roundup!(sa_dl.sdl_len as usize);
 
         sa_dl.sdl_index as u32

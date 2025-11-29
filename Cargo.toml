@@ -16,5 +16,4 @@ ipnetwork = "0.20"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 netlink-packet-route = "*"
-netlink-sys = "*"
 netlink-packet-core = "*"

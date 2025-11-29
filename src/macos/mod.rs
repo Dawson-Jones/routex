@@ -87,7 +87,7 @@ impl RouteAction for RouteSock {
             return Err(io::Error::new(io::ErrorKind::Other, "invalid response"));
         }
 
-        let rt_hdr: &rt_msghdr = unsafe { std::mem::transmute(buf.as_ptr()) };
+        let rt_hdr = unsafe { buf.as_ptr().cast::<rt_msghdr>().as_ref().unwrap() };
 
         assert_eq!(rt_hdr.rtm_type, RTM_ADD as u8);
         assert_eq!(rt_hdr.rtm_version, RTM_VERSION as u8);
@@ -128,7 +128,7 @@ impl RouteAction for RouteSock {
             return Err(io::Error::new(io::ErrorKind::Other, "invalid response"));
         }
 
-        let rt_hdr: &rt_msghdr = unsafe { std::mem::transmute(buf.as_ptr()) };
+        let rt_hdr = unsafe { buf.as_ptr().cast::<rt_msghdr>().as_ref().unwrap() };
 
         assert_eq!(rt_hdr.rtm_version, RTM_VERSION as u8);
         if rt_hdr.rtm_errno != 0 {
@@ -172,7 +172,7 @@ impl RouteAction for RouteSock {
             return Err(io::Error::new(io::ErrorKind::Other, "invalid response"));
         }
 
-        let rtmsg: &mut m_rtmsg = unsafe { std::mem::transmute(buf.as_ptr()) };
+        let rtmsg: &mut m_rtmsg = unsafe { &mut *(buf.as_mut_ptr() as *mut m_rtmsg) };
         assert_eq!(rtmsg.hdr.rtm_version, RTM_VERSION as u8);
         if rtmsg.hdr.rtm_errno != 0 {
             return Err(code2error(rtmsg.hdr.rtm_errno));
@@ -225,7 +225,7 @@ impl RouteAction for RouteSock {
         let mut ret = Route::default();
         let n = self.read(buf)?;
 
-        let rtmsg: &mut m_rtmsg = unsafe { std::mem::transmute(buf.as_ptr()) };
+        let rtmsg: &mut m_rtmsg = unsafe { &mut *(buf.as_mut_ptr() as *mut m_rtmsg) };
         if rtmsg.hdr.rtm_msglen > n as u16 {
             return Err(io::Error::new(
                 io::ErrorKind::Other, 
