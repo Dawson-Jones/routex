@@ -1,5 +1,3 @@
-mod rtmsg;
-
 use std::{
     io::{self, Read, Write},
     net::IpAddr,
@@ -35,9 +33,7 @@ impl AsRawFd for RouteSock {
 
 impl RouteSock {
     pub fn new() -> io::Result<Self> {
-        let fd = syscall!(
-            socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE)
-        )?;
+        let fd = syscall!(socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE))?;
 
         Ok(RouteSock(fd))
     }
@@ -52,10 +48,12 @@ impl RouteSock {
         Ok(())
     }
 
+    // FIXME: rename to `subscribe` in the next breaking release.
     pub fn subscript(&mut self) -> io::Result<()> {
         let mut local = unsafe { std::mem::zeroed::<sockaddr_nl>() };
         local.nl_family = AF_NETLINK as u16;
-        local.nl_groups = nl_mgrp(RTNLGRP_IPV4_ROUTE) | nl_mgrp(RTNLGRP_IPV6_ROUTE) | nl_mgrp(RTNLGRP_MPLS_ROUTE);
+        local.nl_groups =
+            nl_mgrp(RTNLGRP_IPV4_ROUTE) | nl_mgrp(RTNLGRP_IPV6_ROUTE) | nl_mgrp(RTNLGRP_MPLS_ROUTE);
 
         self.bind(local)
     }
@@ -91,53 +89,29 @@ impl Read for RouteSock {
 
 impl Drop for RouteSock {
     fn drop(&mut self) {
-        syscall!(close(self.0)).unwrap();
+        let _ = syscall!(close(self.0));
     }
 }
 
 impl RouteAction for RouteSock {
     fn add(&mut self, route: &Route) -> io::Result<()> {
+        route.validate()?;
+
         let mut nl_hdr = NetlinkHeader::default();
         nl_hdr.flags = NLM_F_REQUEST | NLM_F_EXCL | NLM_F_CREATE | NLM_F_ACK;
+        // TODO: use a monotonically increasing sequence and validate response sequence numbers.
         nl_hdr.sequence_number = 1;
 
-        let mut rt_msg = RouteMessage::default();
+        let mut rt_msg = route_message(route);
         rt_msg.header.table = RouteHeader::RT_TABLE_MAIN;
         rt_msg.header.protocol = RouteProtocol::Boot;
         rt_msg.header.scope = RouteScope::Universe;
         rt_msg.header.kind = RouteType::Unicast;
 
-        match route.destination {
-            std::net::IpAddr::V4(addr) => {
-                rt_msg.header.address_family = AddressFamily::Inet;
-                rt_msg
-                    .attributes
-                    .push(RouteAttribute::Destination(RouteAddress::Inet(addr)));
-            }
-            std::net::IpAddr::V6(addr) => {
-                rt_msg.header.address_family = AddressFamily::Inet6;
-                rt_msg
-                    .attributes
-                    .push(RouteAttribute::Destination(RouteAddress::Inet6(addr)));
-            }
-        }
-        rt_msg.header.destination_prefix_length = route.prefix;
-
         if let Some(gateway) = route.gateway {
-            match gateway {
-                std::net::IpAddr::V4(addr) => {
-                    rt_msg.header.address_family = AddressFamily::Inet;
-                    rt_msg
-                        .attributes
-                        .push(RouteAttribute::Gateway(RouteAddress::Inet(addr)));
-                }
-                std::net::IpAddr::V6(addr) => {
-                    rt_msg.header.address_family = AddressFamily::Inet6;
-                    rt_msg
-                        .attributes
-                        .push(RouteAttribute::Gateway(RouteAddress::Inet6(addr)));
-                }
-            }
+            rt_msg
+                .attributes
+                .push(RouteAttribute::Gateway(route_address(gateway)));
         }
 
         if let Some(index) = route.ifindex {
@@ -153,54 +127,21 @@ impl RouteAction for RouteSock {
 
         let mut buf = [0u8; 4096];
         req.serialize(&mut buf[..req.buffer_len()]);
-
-        self.write(&buf[..req.buffer_len()])?;
-
-        let mut rbuf = [0u8; 4096];
-        let n = self.read(&mut rbuf)?;
-        let nlmsg = <NetlinkMessage<RouteNetlinkMessage>>::deserialize(&rbuf[..n]);
-        // println!("<<< {:?}", nlmsg);
-        match nlmsg {
-            Ok(nlmsg) => {
-                if let NetlinkPayload::Error(e) = nlmsg.payload {
-                    match e.code {
-                        Some(e) => {
-                            return Err(io::Error::new(io::ErrorKind::Other, format!("{e:?}")))
-                        }
-                        None => return Ok(()),
-                    }
-                }
-            }
-            Err(e) => return Err(io::Error::new(io::ErrorKind::Other, format!("{e:?}"))),
-        }
-
-        Ok(())
+        self.write_all(&buf[..req.buffer_len()])?;
+        self.recv_ack()
     }
 
     fn delete(&mut self, route: &Route) -> io::Result<()> {
+        route.validate()?;
+
         let mut nl_hdr = NetlinkHeader::default();
         nl_hdr.flags = NLM_F_REQUEST | NLM_F_ACK;
+        // TODO: use a monotonically increasing sequence and validate response sequence numbers.
         nl_hdr.sequence_number = 1;
 
-        let mut rt_msg = RouteMessage::default();
+        let mut rt_msg = route_message(route);
         rt_msg.header.table = RouteHeader::RT_TABLE_MAIN;
         rt_msg.header.scope = RouteScope::NoWhere;
-
-        match route.destination {
-            std::net::IpAddr::V4(addr) => {
-                rt_msg.header.address_family = AddressFamily::Inet;
-                rt_msg
-                    .attributes
-                    .push(RouteAttribute::Destination(RouteAddress::Inet(addr)));
-            }
-            std::net::IpAddr::V6(addr) => {
-                rt_msg.header.address_family = AddressFamily::Inet6;
-                rt_msg
-                    .attributes
-                    .push(RouteAttribute::Destination(RouteAddress::Inet6(addr)));
-            }
-        }
-        rt_msg.header.destination_prefix_length = route.prefix;
 
         let mut req = NetlinkMessage::new(
             nl_hdr,
@@ -210,39 +151,23 @@ impl RouteAction for RouteSock {
 
         let mut buf = [0u8; 4096];
         req.serialize(&mut buf[..req.buffer_len()]);
-        self.write(&buf[..req.buffer_len()])?;
-
-        let mut rbuf = [0u8; 4096];
-        let n = self.read(&mut rbuf)?;
-        let nlmsg = <NetlinkMessage<RouteNetlinkMessage>>::deserialize(&rbuf[..n]);
-        // println!("<<< {:?}", nlmsg);
-        match nlmsg {
-            Ok(nlmsg) => {
-                if let NetlinkPayload::Error(e) = nlmsg.payload {
-                    match e.code {
-                        Some(e) => {
-                            return Err(io::Error::new(io::ErrorKind::Other, format!("{e:?}")))
-                        }
-                        None => return Ok(()),
-                    }
-                }
-            }
-            Err(e) => return Err(io::Error::new(io::ErrorKind::Other, format!("{e:?}"))),
-        }
-
-        Ok(())
+        self.write_all(&buf[..req.buffer_len()])?;
+        self.recv_ack()
     }
 
     fn get(&mut self, route: &Route) -> io::Result<Route> {
+        route.validate()?;
+
         let mut nl_hdr = NetlinkHeader::default();
         nl_hdr.flags = NLM_F_DUMP | NLM_F_REQUEST;
+        // TODO: use a monotonically increasing sequence and validate response sequence numbers.
         nl_hdr.sequence_number = 1;
 
         let mut rt_msg = RouteMessage::default();
-        rt_msg.header.address_family = AddressFamily::Inet;
+        rt_msg.header.address_family = address_family(route.destination);
         rt_msg
             .attributes
-            .push(RouteAttribute::Table(254 /*table main*/));
+            .push(RouteAttribute::Table(u32::from(RouteHeader::RT_TABLE_MAIN)));
         if let Some(index) = route.ifindex {
             rt_msg.attributes.push(RouteAttribute::Oif(index));
         }
@@ -254,205 +179,179 @@ impl RouteAction for RouteSock {
         req.finalize();
         let mut buf = [0u8; 4096];
         req.serialize(&mut buf[..req.buffer_len()]);
-        // println!(">>> {:?}", &buf[..req.buffer_len()]);
-        self.write(&buf[..req.buffer_len()])?;
+        self.write_all(&buf[..req.buffer_len()])?;
 
-        let mut ret = Route::default();
-        let mut offset = 0;
-        let mut rbuf = [0u8; 4096];
-        let n = self.read(&mut rbuf)?;
+        // TODO: return Option<Route> so callers can distinguish a miss from a real default route.
+        let mut ret = Route::new(unspecified(address_family(route.destination)), 0);
         loop {
-            let bytes = &rbuf[offset..];
+            let mut rbuf = [0u8; 16384];
+            let n = self.read(&mut rbuf)?;
+            let mut offset = 0;
 
-            let nlmsg = match <NetlinkMessage<RouteNetlinkMessage>>::deserialize(bytes) {
-                Ok(nlmsg) => {
-                    nlmsg
+            while offset < n {
+                let nlmsg = parse_nlmsg(&rbuf[offset..n])?;
+                let length = nlmsg.header.length as usize;
+                if length == 0 {
+                    return Err(io::Error::other("zero-length netlink message"));
                 }
-                Err(e) => {
-                    return Err(io::Error::new(io::ErrorKind::Other, format!("{e:?}")));
-                }
-            };
 
-            if matches!(nlmsg.payload, NetlinkPayload::Done(_)) {
-                // println!("Done!");
-                break;
-            }
-
-            if let NetlinkPayload::InnerMessage(rtnl_msg) = nlmsg.payload {
-                if let RouteNetlinkMessage::NewRoute(rt_msg) = rtnl_msg {
-                    if rt_msg.header.destination_prefix_length <= route.prefix
-                        && rt_msg.header.destination_prefix_length >= ret.prefix
-                    {
-                        let mut t_route = Route::default();
-                        t_route.prefix = rt_msg.header.destination_prefix_length;
-
-                        let mut travel_over_nomal = true;
-                        for attr in &rt_msg.attributes {
-                            match attr {
-                                RouteAttribute::Destination(dst) => {
-                                    if let RouteAddress::Inet(dst) = dst {
-                                        if let IpAddr::V4(target) = route.destination {
-                                            let contained = IpNetwork::new(
-                                                IpAddr::V4(*dst),
-                                                rt_msg.header.destination_prefix_length,
-                                            )
-                                            .unwrap()
-                                            .contains(IpAddr::V4(target));
-
-                                            if !contained {
-                                                travel_over_nomal = false;
-                                                break;
-                                            }
-
-                                            t_route.destination = IpAddr::V4(*dst)
-                                        }
-                                    } else if let RouteAddress::Inet6(dst) = dst {
-                                        if let IpAddr::V6(target) = route.destination {
-                                            let contained = IpNetwork::new(
-                                                IpAddr::V6(*dst),
-                                                rt_msg.header.destination_prefix_length,
-                                            )
-                                            .unwrap()
-                                            .contains(IpAddr::V6(target));
-
-                                            if !contained {
-                                                travel_over_nomal = false;
-                                                break;
-                                            }
-
-                                            t_route.destination = IpAddr::V6(*dst)
-                                        }
-                                    }
+                match nlmsg.payload {
+                    NetlinkPayload::Done(_) => return Ok(ret),
+                    NetlinkPayload::Error(e) => {
+                        if let Some(e) = e.code {
+                            return Err(io::Error::other(format!("{e:?}")));
+                        }
+                        return Ok(ret);
+                    }
+                    NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewRoute(rt_msg)) => {
+                        if rt_msg.header.destination_prefix_length <= route.prefix
+                            && rt_msg.header.destination_prefix_length >= ret.prefix
+                        {
+                            if let Some(candidate) = route_from_message(&rt_msg)? {
+                                if route_contains(&candidate, route.destination)? {
+                                    ret = candidate;
                                 }
-
-                                RouteAttribute::Gateway(gw) => {
-                                    if let RouteAddress::Inet(gw) = gw {
-                                        t_route.gateway = Some(IpAddr::V4(*gw));
-                                    } else if let RouteAddress::Inet6(gw) = gw {
-                                        t_route.gateway = Some(IpAddr::V6(*gw));
-                                    } else {
-                                        return Err(io::Error::new(
-                                            io::ErrorKind::Other,
-                                            "Invalid gateway",
-                                        ));
-                                    }
-                                }
-
-                                RouteAttribute::Oif(index) => {
-                                    t_route.ifindex = Some(*index);
-                                }
-
-                                _ => (),
                             }
                         }
-
-                        if travel_over_nomal {
-                            ret = t_route
-                        }
                     }
+                    _ => {}
                 }
-            }
 
-            offset += nlmsg.header.length as usize;
-            if offset == n || nlmsg.header.length == 0 {
-                // println!("offset: {}, n: {}, nlmsg len: {}", offset, n, nlmsg.header.length);
-                break;
+                offset += nlmsg_align(length);
             }
         }
-
-        Ok(ret)
     }
 
     fn monitor(&mut self, buf: &mut [u8]) -> io::Result<(RouteChange, Route)> {
-        // maybe have another netlink message on same buf. see `get`
+        // TODO: the socket can return multiple route messages in one read; the current trait only returns one.
         let n = self.read(buf)?;
-        println!("read {n} bytes");
-
-        let nlmsg = match <NetlinkMessage<RouteNetlinkMessage>>::deserialize(&buf[..n]) {
-            Ok(nlmsg) => {
-                nlmsg
-            }
-            Err(e) => {
-                return Err(io::Error::new(io::ErrorKind::Other, format!("{e:?}")));
-            }
-        };
-
-        let mut ret = Route::default();
+        let nlmsg = parse_nlmsg(&buf[..n])?;
 
         if let NetlinkPayload::InnerMessage(rtnl_msg) = nlmsg.payload {
             match rtnl_msg {
-                RouteNetlinkMessage::NewRoute(rtmsg) => {
-                    ret.prefix = rtmsg.header.destination_prefix_length;
-
-                    for attr in &rtmsg.attributes {
-                        match attr {
-                            RouteAttribute::Destination(addr) => {
-                                if let RouteAddress::Inet(addr) = addr {
-                                    ret.destination = IpAddr::V4(*addr);
-                                } else if let RouteAddress::Inet6(addr) = addr {
-                                    ret.destination = IpAddr::V6(*addr);
-                                }
-                            },
-                            RouteAttribute::Gateway(addr) => {
-                                if let RouteAddress::Inet(addr) = addr {
-                                    ret.gateway = Some(IpAddr::V4(*addr));
-                                } else if let RouteAddress::Inet6(addr) = addr {
-                                    ret.gateway = Some(IpAddr::V6(*addr));
-                                }
-
-                            },
-                            RouteAttribute::Oif(ifindex) => {
-                                ret.ifindex = Some(*ifindex);
-                            },
-                            _ => (),
-                        }
-                    }
-
-                    return Ok((RouteChange::ADD, ret))
-                },
-                RouteNetlinkMessage::DelRoute(rtmsg) => {
-                    ret.prefix = rtmsg.header.destination_prefix_length;
-
-                    for attr in &rtmsg.attributes {
-                        match attr {
-                            RouteAttribute::Destination(addr) => {
-                                if let RouteAddress::Inet(addr) = addr {
-                                    ret.destination = IpAddr::V4(*addr);
-                                } else if let RouteAddress::Inet6(addr) = addr {
-                                    ret.destination = IpAddr::V6(*addr);
-                                }
-                            },
-                            RouteAttribute::Gateway(addr) => {
-                                if let RouteAddress::Inet(addr) = addr {
-                                    ret.gateway = Some(IpAddr::V4(*addr));
-                                } else if let RouteAddress::Inet6(addr) = addr {
-                                    ret.gateway = Some(IpAddr::V6(*addr));
-                                }
-
-                            },
-                            RouteAttribute::Oif(ifindex) => {
-                                ret.ifindex = Some(*ifindex);
-                            },
-                            _ => (),
-                        }
-                    }
-
-                    return Ok((RouteChange::DELETE, ret))
-                },
-                _ => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        format!("Unexpected rtnl message: {:?}", rtnl_msg),
-                    ))
-                },
+                RouteNetlinkMessage::NewRoute(rtmsg) => Ok((
+                    RouteChange::ADD,
+                    route_from_message(&rtmsg)?
+                        .ok_or_else(|| io::Error::other("unsupported route address"))?,
+                )),
+                RouteNetlinkMessage::DelRoute(rtmsg) => Ok((
+                    RouteChange::DELETE,
+                    route_from_message(&rtmsg)?
+                        .ok_or_else(|| io::Error::other("unsupported route address"))?,
+                )),
+                _ => Err(io::Error::other(format!(
+                    "Unexpected rtnl message: {:?}",
+                    rtnl_msg
+                ))),
             }
         } else {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("not rtnl message: {:?}", nlmsg),
-            ))
+            Err(io::Error::other(format!("not rtnl message: {:?}", nlmsg)))
+        }
+    }
+}
+
+impl RouteSock {
+    fn recv_ack(&mut self) -> io::Result<()> {
+        // This is only for one request/ACK exchange, not dump or subscription responses.
+        let mut rbuf = [0u8; 4096];
+        let n = self.read(&mut rbuf)?;
+        let nlmsg = parse_nlmsg(&rbuf[..n])?;
+
+        if let NetlinkPayload::Error(e) = nlmsg.payload {
+            if let Some(e) = e.code {
+                return Err(io::Error::other(format!("{e:?}")));
+            }
         }
 
+        Ok(())
+    }
+}
+
+fn route_message(route: &Route) -> RouteMessage {
+    let mut rt_msg = RouteMessage::default();
+    rt_msg.header.address_family = address_family(route.destination);
+    rt_msg.header.destination_prefix_length = route.prefix;
+    rt_msg
+        .attributes
+        .push(RouteAttribute::Destination(route_address(
+            route.destination,
+        )));
+    rt_msg
+}
+
+fn route_from_message(rt_msg: &RouteMessage) -> io::Result<Option<Route>> {
+    let mut route = Route::new(
+        unspecified(rt_msg.header.address_family),
+        rt_msg.header.destination_prefix_length,
+    );
+
+    for attr in &rt_msg.attributes {
+        match attr {
+            RouteAttribute::Destination(addr) => {
+                let Some(destination) = ip_addr(addr) else {
+                    return Ok(None);
+                };
+                route.destination = destination;
+            }
+            RouteAttribute::Gateway(addr) => {
+                let Some(gateway) = ip_addr(addr) else {
+                    return Ok(None);
+                };
+                route.gateway = Some(gateway);
+            }
+            RouteAttribute::Oif(index) => route.ifindex = Some(*index),
+            _ => {}
+        }
+    }
+
+    Ok(Some(route))
+}
+
+fn route_contains(route: &Route, target: IpAddr) -> io::Result<bool> {
+    if address_family(route.destination) != address_family(target) {
+        return Ok(false);
+    }
+
+    Ok(IpNetwork::new(route.destination, route.prefix)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?
+        .contains(target))
+}
+
+fn parse_nlmsg(bytes: &[u8]) -> io::Result<NetlinkMessage<RouteNetlinkMessage>> {
+    <NetlinkMessage<RouteNetlinkMessage>>::deserialize(bytes)
+        .map_err(|e| io::Error::other(format!("{e:?}")))
+}
+
+fn nlmsg_align(len: usize) -> usize {
+    (len + 3) & !3
+}
+
+fn address_family(addr: IpAddr) -> AddressFamily {
+    match addr {
+        IpAddr::V4(_) => AddressFamily::Inet,
+        IpAddr::V6(_) => AddressFamily::Inet6,
+    }
+}
+
+fn unspecified(family: AddressFamily) -> IpAddr {
+    match family {
+        AddressFamily::Inet6 => IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+        _ => IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+    }
+}
+
+fn route_address(addr: IpAddr) -> RouteAddress {
+    match addr {
+        IpAddr::V4(addr) => RouteAddress::Inet(addr),
+        IpAddr::V6(addr) => RouteAddress::Inet6(addr),
+    }
+}
+
+fn ip_addr(addr: &RouteAddress) -> Option<IpAddr> {
+    match addr {
+        RouteAddress::Inet(addr) => Some(IpAddr::V4(*addr)),
+        RouteAddress::Inet6(addr) => Some(IpAddr::V6(*addr)),
+        _ => None,
     }
 }
 

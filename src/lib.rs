@@ -1,20 +1,23 @@
+#![allow(clippy::macro_metavars_in_unsafe)]
+
 use std::{
     ffi::CString,
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
 };
 
-#[cfg(all(target_os = "macos"))]
-mod macos;
-#[cfg(all(target_os = "linux"))]
+#[cfg(target_os = "linux")]
 mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
 
-#[cfg(all(target_os = "linux"))]
+#[cfg(target_os = "linux")]
 pub use linux::RouteSock;
-#[cfg(all(target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub use macos::RouteSock;
 
 #[macro_export]
+#[allow(clippy::macro_metavars_in_unsafe)]
 macro_rules! syscall {
     ($fn: ident ( $($arg: expr),* ) ) => {{
         #[allow(unused_unsafe)]
@@ -27,7 +30,7 @@ macro_rules! syscall {
     }};
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Route {
     pub destination: IpAddr,
     pub prefix: u8,
@@ -56,10 +59,6 @@ impl Route {
         }
     }
 
-    pub fn default() -> Route {
-        Route::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0)
-    }
-
     pub(crate) fn mask(&self) -> IpAddr {
         match self.destination {
             IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::from(
@@ -76,6 +75,34 @@ impl Route {
             IpAddr::V4(netmask) => <Ipv4Addr as Into<u32>>::into(netmask).leading_ones() as u8,
             IpAddr::V6(netmask) => <Ipv6Addr as Into<u128>>::into(netmask).leading_ones() as u8,
         }
+    }
+
+    pub(crate) fn validate(&self) -> io::Result<()> {
+        let max_prefix = match self.destination {
+            IpAddr::V4(_) => 32,
+            IpAddr::V6(_) => 128,
+        };
+
+        if self.prefix > max_prefix {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid prefix {} for {}", self.prefix, self.destination),
+            ));
+        }
+
+        if let Some(gateway) = self.gateway {
+            if std::mem::discriminant(&self.destination) != std::mem::discriminant(&gateway) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "gateway {gateway} does not match destination {}",
+                        self.destination
+                    ),
+                ));
+            }
+        }
+
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]
@@ -137,5 +164,35 @@ pub fn if_nametoindex(name: &str) -> Option<u32> {
     let name = CString::new(name).ok()?;
     let ifindex = unsafe { libc::if_nametoindex(name.as_ptr()) };
 
-    Some(ifindex)
+    if ifindex == 0 {
+        None
+    } else {
+        Some(ifindex)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_rejects_prefix_outside_address_family() {
+        let route = Route::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 33);
+
+        assert_eq!(
+            route.validate().unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn validate_rejects_mismatched_gateway_family() {
+        let route = Route::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+            .gateway(IpAddr::V6(Ipv6Addr::LOCALHOST));
+
+        assert_eq!(
+            route.validate().unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
 }

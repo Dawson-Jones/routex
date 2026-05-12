@@ -19,10 +19,8 @@ fn add_by_gateway() {
     // println!("{:?}", route);
     // let gateway = route.gateway.unwrap();
 
-    let route = Route::new(
-        "1.9.4.5".parse().unwrap(),
-        "32".parse().unwrap()
-    ).gateway("10.211.55.1".parse().unwrap());
+    let route = Route::new("1.9.4.5".parse().unwrap(), "32".parse().unwrap())
+        .gateway("10.211.55.1".parse().unwrap());
     handle.add(&route).unwrap();
     println!("1.9.4.5/32 add to utun4");
 }
@@ -31,10 +29,7 @@ fn add_by_iface() {
     let mut handle = RouteSock::new().unwrap();
     let ifindex = if_nametoindex("enp0s5").unwrap();
 
-    let route = Route::new(
-        "1.9.4.5".parse().unwrap(), 
-        "32".parse().unwrap()
-    ).ifindex(ifindex);
+    let route = Route::new("1.9.4.5".parse().unwrap(), "32".parse().unwrap()).ifindex(ifindex);
     handle.add(&route).unwrap();
     println!("1.9.4.5/32 add to en0");
 }

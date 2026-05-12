@@ -68,7 +68,7 @@ impl m_rtmsg {
                 sa_in6.sin6_port = 0;
                 sa_in6.sin6_flowinfo = 0;
                 sa_in6.sin6_addr = in6_addr {
-                    s6_addr: unsafe { std::mem::transmute(addr.octets()) },
+                    s6_addr: addr.octets(),
                 };
                 sa_in6.sin6_scope_id = 0;
 
@@ -82,7 +82,7 @@ impl m_rtmsg {
     }
 
     pub fn put_gateway(&mut self, gateway: &IpAddr) {
-        self.put_addr(&gateway)
+        self.put_addr(gateway)
     }
 
     pub fn put_index(&mut self, ifindex: u32) {
@@ -96,7 +96,7 @@ impl m_rtmsg {
     }
 
     pub fn put_netmask(&mut self, mask: &IpAddr) {
-        self.put_addr(&mask)
+        self.put_addr(mask)
     }
 
     pub fn get_addr(&mut self) -> IpAddr {
@@ -109,14 +109,14 @@ impl m_rtmsg {
 
                 self.attr_len += roundup!(sa_in.sin_len as usize);
 
-                return IpAddr::from(sa_in.sin_addr.s_addr.to_ne_bytes());
+                IpAddr::from(sa_in.sin_addr.s_addr.to_ne_bytes())
             } else {
                 let sa_in6_ptr = sa_ptr as *const sockaddr_in6;
                 let sa_in6 = &*sa_in6_ptr;
 
                 self.attr_len += roundup!(sa_in6.sin6_len as usize);
 
-                return IpAddr::from(sa_in6.sin6_addr.s6_addr);
+                IpAddr::from(sa_in6.sin6_addr.s6_addr)
             }
         }
     }

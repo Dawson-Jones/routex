@@ -4,7 +4,7 @@ fn main() {
     let mut handle = RouteSock::new().unwrap();
 
     #[cfg(target_os = "linux")]
-    handle.subscript().unwrap();   
+    handle.subscript().unwrap();
 
     let mut buf = RouteSock::new_buf();
 
@@ -18,7 +18,7 @@ fn main() {
                     println!("default route added: {:?}", route);
                 }
             }
-            routex::RouteChange::OTHER(n) if n == 0xc/* RTM_NEWADDR */ => {
+            routex::RouteChange::OTHER(0xc) /* RTM_NEWADDR */ => {
                 let route = ret.1;
                 if route.destination.is_unspecified() {
                     println!("default addr added: {:?}", route);
