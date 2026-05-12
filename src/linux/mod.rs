@@ -48,8 +48,7 @@ impl RouteSock {
         Ok(())
     }
 
-    // FIXME: rename to `subscribe` in the next breaking release.
-    pub fn subscript(&mut self) -> io::Result<()> {
+    pub fn subscribe(&mut self) -> io::Result<()> {
         let mut local = unsafe { std::mem::zeroed::<sockaddr_nl>() };
         local.nl_family = AF_NETLINK as u16;
         local.nl_groups =

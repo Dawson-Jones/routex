@@ -4,7 +4,7 @@ fn main() {
     let mut handle = RouteSock::new().unwrap();
 
     #[cfg(target_os = "linux")]
-    handle.subscript().unwrap();
+    handle.subscribe().unwrap();
 
     let mut buf = RouteSock::new_buf();
 
