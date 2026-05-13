@@ -10,11 +10,15 @@ use std::{
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(target_os = "windows")]
+mod windows;
 
 #[cfg(target_os = "linux")]
 pub use linux::RouteSock;
 #[cfg(target_os = "macos")]
 pub use macos::RouteSock;
+#[cfg(target_os = "windows")]
+pub use windows::RouteSock;
 
 #[macro_export]
 #[allow(clippy::macro_metavars_in_unsafe)]
@@ -59,6 +63,7 @@ impl Route {
         }
     }
 
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) fn mask(&self) -> IpAddr {
         match self.destination {
             IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::from(
@@ -70,6 +75,7 @@ impl Route {
         }
     }
 
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) fn cidr(&mut self, netmask: IpAddr) {
         self.prefix = match netmask {
             IpAddr::V4(netmask) => <Ipv4Addr as Into<u32>>::into(netmask).leading_ones() as u8,
@@ -121,7 +127,7 @@ impl Route {
         self
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     pub fn interface(mut self, interface: &str) -> Route {
         self.ifindex = if_nametoindex(interface);
         self
@@ -162,13 +168,16 @@ pub trait RouteAction {
 
 pub fn if_nametoindex(name: &str) -> Option<u32> {
     let name = CString::new(name).ok()?;
+
+    #[cfg(not(target_os = "windows"))]
     let ifindex = unsafe { libc::if_nametoindex(name.as_ptr()) };
 
-    if ifindex == 0 {
-        None
-    } else {
-        Some(ifindex)
-    }
+    #[cfg(target_os = "windows")]
+    let ifindex = unsafe {
+        windows_sys::Win32::NetworkManagement::IpHelper::if_nametoindex(name.as_ptr().cast())
+    };
+
+    (ifindex != 0).then_some(ifindex)
 }
 
 #[cfg(test)]
