@@ -1,16 +1,16 @@
 use std::{
     io::{self, Read, Write},
     net::IpAddr,
+    num::NonZeroI32,
     os::fd::{AsRawFd, RawFd},
 };
 
-use ipnetwork::IpNetwork;
 use libc::{
     sockaddr_nl, AF_NETLINK, NETLINK_ROUTE, RTNLGRP_IPV4_ROUTE, RTNLGRP_IPV6_ROUTE,
     RTNLGRP_MPLS_ROUTE, SOCK_CLOEXEC, SOCK_RAW,
 };
 use netlink_packet_core::{
-    NetlinkHeader, NetlinkMessage, NetlinkPayload, NLM_F_ACK, NLM_F_CREATE, NLM_F_DUMP, NLM_F_EXCL,
+    NetlinkHeader, NetlinkMessage, NetlinkPayload, NLM_F_ACK, NLM_F_CREATE, NLM_F_EXCL,
     NLM_F_REQUEST,
 };
 use netlink_packet_route::{
@@ -101,7 +101,7 @@ impl RouteAction for RouteSock {
         // TODO: use a monotonically increasing sequence and validate response sequence numbers.
         nl_hdr.sequence_number = 1;
 
-        let mut rt_msg = route_message(route);
+        let mut rt_msg = route_change_message(route);
         rt_msg.header.table = RouteHeader::RT_TABLE_MAIN;
         rt_msg.header.protocol = RouteProtocol::Boot;
         rt_msg.header.scope = RouteScope::Universe;
@@ -114,7 +114,9 @@ impl RouteAction for RouteSock {
         }
 
         if let Some(index) = route.ifindex {
-            rt_msg.header.scope = RouteScope::Link;
+            if route.gateway.is_none() {
+                rt_msg.header.scope = RouteScope::Link;
+            }
             rt_msg.attributes.push(RouteAttribute::Oif(index));
         }
 
@@ -138,7 +140,7 @@ impl RouteAction for RouteSock {
         // TODO: use a monotonically increasing sequence and validate response sequence numbers.
         nl_hdr.sequence_number = 1;
 
-        let mut rt_msg = route_message(route);
+        let mut rt_msg = route_change_message(route);
         rt_msg.header.table = RouteHeader::RT_TABLE_MAIN;
         rt_msg.header.scope = RouteScope::NoWhere;
 
@@ -158,18 +160,11 @@ impl RouteAction for RouteSock {
         route.validate()?;
 
         let mut nl_hdr = NetlinkHeader::default();
-        nl_hdr.flags = NLM_F_DUMP | NLM_F_REQUEST;
+        nl_hdr.flags = NLM_F_REQUEST;
         // TODO: use a monotonically increasing sequence and validate response sequence numbers.
         nl_hdr.sequence_number = 1;
 
-        let mut rt_msg = RouteMessage::default();
-        rt_msg.header.address_family = address_family(route.destination);
-        rt_msg
-            .attributes
-            .push(RouteAttribute::Table(u32::from(RouteHeader::RT_TABLE_MAIN)));
-        if let Some(index) = route.ifindex {
-            rt_msg.attributes.push(RouteAttribute::Oif(index));
-        }
+        let rt_msg = route_lookup_message(route);
 
         let mut req = NetlinkMessage::new(
             nl_hdr,
@@ -180,45 +175,7 @@ impl RouteAction for RouteSock {
         req.serialize(&mut buf[..req.buffer_len()]);
         self.write_all(&buf[..req.buffer_len()])?;
 
-        // TODO: return Option<Route> so callers can distinguish a miss from a real default route.
-        let mut ret = Route::new(unspecified(address_family(route.destination)), 0);
-        loop {
-            let mut rbuf = [0u8; 16384];
-            let n = self.read(&mut rbuf)?;
-            let mut offset = 0;
-
-            while offset < n {
-                let nlmsg = parse_nlmsg(&rbuf[offset..n])?;
-                let length = nlmsg.header.length as usize;
-                if length == 0 {
-                    return Err(io::Error::other("zero-length netlink message"));
-                }
-
-                match nlmsg.payload {
-                    NetlinkPayload::Done(_) => return Ok(ret),
-                    NetlinkPayload::Error(e) => {
-                        if let Some(e) = e.code {
-                            return Err(io::Error::other(format!("{e:?}")));
-                        }
-                        return Ok(ret);
-                    }
-                    NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewRoute(rt_msg)) => {
-                        if rt_msg.header.destination_prefix_length <= route.prefix
-                            && rt_msg.header.destination_prefix_length >= ret.prefix
-                        {
-                            if let Some(candidate) = route_from_message(&rt_msg)? {
-                                if route_contains(&candidate, route.destination)? {
-                                    ret = candidate;
-                                }
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-
-                offset += nlmsg_align(length);
-            }
-        }
+        self.recv_route_response()
     }
 
     fn monitor(&mut self, buf: &mut [u8]) -> io::Result<(RouteChange, Route)> {
@@ -250,6 +207,42 @@ impl RouteAction for RouteSock {
 }
 
 impl RouteSock {
+    fn recv_route_response(&mut self) -> io::Result<Route> {
+        loop {
+            let mut rbuf = [0u8; 16384];
+            let n = self.read(&mut rbuf)?;
+            let mut offset = 0;
+
+            while offset < n {
+                let nlmsg = parse_nlmsg(&rbuf[offset..n])?;
+                let length = nlmsg.header.length as usize;
+                if length == 0 {
+                    return Err(io::Error::other("zero-length netlink message"));
+                }
+
+                match nlmsg.payload {
+                    NetlinkPayload::Done(_) => {
+                        return Err(io::Error::new(io::ErrorKind::NotFound, "route not found"));
+                    }
+                    NetlinkPayload::Error(e) => {
+                        if let Some(e) = e.code {
+                            return Err(netlink_error(e));
+                        }
+                        return Err(io::Error::new(io::ErrorKind::NotFound, "route not found"));
+                    }
+                    NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewRoute(rt_msg)) => {
+                        if let Some(candidate) = route_from_message(&rt_msg)? {
+                            return Ok(candidate);
+                        }
+                    }
+                    _ => {}
+                }
+
+                offset += nlmsg_align(length);
+            }
+        }
+    }
+
     fn recv_ack(&mut self) -> io::Result<()> {
         // This is only for one request/ACK exchange, not dump or subscription responses.
         let mut rbuf = [0u8; 4096];
@@ -258,7 +251,7 @@ impl RouteSock {
 
         if let NetlinkPayload::Error(e) = nlmsg.payload {
             if let Some(e) = e.code {
-                return Err(io::Error::other(format!("{e:?}")));
+                return Err(netlink_error(e));
             }
         }
 
@@ -266,7 +259,12 @@ impl RouteSock {
     }
 }
 
-fn route_message(route: &Route) -> RouteMessage {
+fn netlink_error(code: NonZeroI32) -> io::Error {
+    let raw = code.get();
+    io::Error::from_raw_os_error(if raw < 0 { -raw } else { raw })
+}
+
+fn route_change_message(route: &Route) -> RouteMessage {
     let mut rt_msg = RouteMessage::default();
     rt_msg.header.address_family = address_family(route.destination);
     rt_msg.header.destination_prefix_length = route.prefix;
@@ -275,6 +273,23 @@ fn route_message(route: &Route) -> RouteMessage {
         .push(RouteAttribute::Destination(route_address(
             route.destination,
         )));
+    rt_msg
+}
+
+fn route_lookup_message(route: &Route) -> RouteMessage {
+    let mut rt_msg = RouteMessage::default();
+    rt_msg.header.address_family = address_family(route.destination);
+    rt_msg.header.destination_prefix_length = route.prefix;
+    rt_msg
+        .attributes
+        .push(RouteAttribute::Destination(route_address(
+            route.destination,
+        )));
+
+    if let Some(index) = route.ifindex {
+        rt_msg.attributes.push(RouteAttribute::Oif(index));
+    }
+
     rt_msg
 }
 
@@ -304,16 +319,6 @@ fn route_from_message(rt_msg: &RouteMessage) -> io::Result<Option<Route>> {
     }
 
     Ok(Some(route))
-}
-
-fn route_contains(route: &Route, target: IpAddr) -> io::Result<bool> {
-    if address_family(route.destination) != address_family(target) {
-        return Ok(false);
-    }
-
-    Ok(IpNetwork::new(route.destination, route.prefix)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?
-        .contains(target))
 }
 
 fn parse_nlmsg(bytes: &[u8]) -> io::Result<NetlinkMessage<RouteNetlinkMessage>> {
