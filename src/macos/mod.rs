@@ -293,7 +293,11 @@ fn write_route_addrs(route: &Route, kind: RouteRequestKind) -> m_rtmsg {
         // `route add ... -interface ifname` is encoded as a link-layer gateway.
         rtmsg.hdr.rtm_addrs |= RTA_GATEWAY;
     }
-    if !matches!(kind, RouteRequestKind::Delete) && route.ifindex.is_some() {
+    // Query asks the kernel to fill in IFP, so the slot must be reserved
+    // even when the caller does not yet know the ifindex.
+    let request_ifp = matches!(kind, RouteRequestKind::Query)
+        || (matches!(kind, RouteRequestKind::Add) && route.ifindex.is_some());
+    if request_ifp {
         rtmsg.hdr.rtm_addrs |= RTA_IFP;
     }
 
