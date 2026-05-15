@@ -1,10 +1,6 @@
 #![allow(clippy::macro_metavars_in_unsafe)]
 
-use std::{
-    ffi::CString,
-    io,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr},
-};
+use std::{ffi::CString, io, net::IpAddr};
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -44,6 +40,8 @@ pub struct Route {
 
 impl Default for Route {
     fn default() -> Self {
+        use std::net::Ipv4Addr;
+
         Route {
             destination: IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
             prefix: 0,
@@ -63,8 +61,10 @@ impl Route {
         }
     }
 
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    #[cfg(target_os = "macos")]
     pub(crate) fn mask(&self) -> IpAddr {
+        use std::net::{Ipv4Addr, Ipv6Addr};
+
         match self.destination {
             IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::from(
                 u32::MAX.checked_shl(32 - self.prefix as u32).unwrap_or(0),
@@ -75,8 +75,10 @@ impl Route {
         }
     }
 
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    #[cfg(target_os = "macos")]
     pub(crate) fn cidr(&mut self, netmask: IpAddr) {
+        use std::net::{Ipv4Addr, Ipv6Addr};
+
         self.prefix = match netmask {
             IpAddr::V4(netmask) => <Ipv4Addr as Into<u32>>::into(netmask).leading_ones() as u8,
             IpAddr::V6(netmask) => <Ipv6Addr as Into<u128>>::into(netmask).leading_ones() as u8,
@@ -183,6 +185,7 @@ pub fn if_nametoindex(name: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
 
     #[test]
     fn validate_rejects_prefix_outside_address_family() {
