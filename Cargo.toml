@@ -1,7 +1,7 @@
 [package]
 name = "routex"
 version = "0.1.5"
-edition = "2021"
+edition = "2024"
 
 license = "MIT"
 authors = ["dawson a957360688@gmail.com"]
@@ -12,11 +12,11 @@ description = "cross platform route implement"
 
 [dependencies]
 libc = "0.2"
-ipnetwork = "0.20"
+ipnetwork = "0.21"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-netlink-packet-route = "0.19"
-netlink-packet-core = "0.7"
+netlink-packet-route = "0.30"
+netlink-packet-core = "0.8"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.61", features = [

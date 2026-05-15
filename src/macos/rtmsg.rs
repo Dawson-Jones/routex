@@ -1,8 +1,8 @@
 use std::net::IpAddr;
 
 use libc::{
-    in6_addr, in_addr, rt_msghdr, sockaddr, sockaddr_dl, sockaddr_in, sockaddr_in6, AF_INET,
-    AF_INET6, AF_LINK, RTM_VERSION,
+    AF_INET, AF_INET6, AF_LINK, RTM_VERSION, in_addr, in6_addr, rt_msghdr, sockaddr, sockaddr_dl,
+    sockaddr_in, sockaddr_in6,
 };
 
 #[repr(C)]

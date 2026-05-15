@@ -13,8 +13,8 @@ use windows_sys::Win32::{
         GetIpForwardTable2, InitializeIpForwardEntry, MIB_IPFORWARD_ROW2, MIB_IPFORWARD_TABLE2,
     },
     Networking::WinSock::{
-        NlroManual, ADDRESS_FAMILY, AF_INET, AF_INET6, IN6_ADDR, IN_ADDR, IN_ADDR_0,
-        MIB_IPPROTO_NETMGMT, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_INET,
+        ADDRESS_FAMILY, AF_INET, AF_INET6, IN_ADDR, IN_ADDR_0, IN6_ADDR, MIB_IPPROTO_NETMGMT,
+        NlroManual, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_INET,
     },
 };
 

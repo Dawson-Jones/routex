@@ -1,4 +1,4 @@
-use routex::{if_nametoindex, Route, RouteAction, RouteSock};
+use routex::{Route, RouteAction, RouteSock, if_nametoindex};
 
 fn main() {
     let mut handle = RouteSock::new().unwrap();

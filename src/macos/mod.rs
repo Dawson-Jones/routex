@@ -6,11 +6,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::{macos::rtmsg::m_rtmsg, syscall, Route, RouteAction, RouteChange};
+use crate::{Route, RouteAction, RouteChange, macos::rtmsg::m_rtmsg, syscall};
 use libc::{
-    pollfd, rt_msghdr, AF_INET, AF_INET6, AF_ROUTE, AF_UNSPEC, POLLIN, RTAX_MAX, RTA_DST,
-    RTA_GATEWAY, RTA_IFP, RTA_NETMASK, RTF_GATEWAY, RTF_HOST, RTF_STATIC, RTF_UP, RTM_ADD,
-    RTM_DELETE, RTM_GET, RTM_VERSION, SOCK_RAW,
+    AF_INET, AF_INET6, AF_ROUTE, AF_UNSPEC, POLLIN, RTA_DST, RTA_GATEWAY, RTA_IFP, RTA_NETMASK,
+    RTAX_MAX, RTF_GATEWAY, RTF_HOST, RTF_STATIC, RTF_UP, RTM_ADD, RTM_DELETE, RTM_GET, RTM_VERSION,
+    SOCK_RAW, pollfd, rt_msghdr,
 };
 
 const ROUTE_RESPONSE_TIMEOUT: Duration = Duration::from_millis(500);

@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use routex::{if_nametoindex, Route, RouteAction, RouteSock};
+use routex::{Route, RouteAction, RouteSock, if_nametoindex};
 
 use std::fs::read_to_string;
 

@@ -6,22 +6,22 @@ use std::{
 };
 
 use libc::{
-    sockaddr_nl, AF_NETLINK, NETLINK_ROUTE, RTNLGRP_IPV4_ROUTE, RTNLGRP_IPV6_ROUTE,
-    RTNLGRP_MPLS_ROUTE, SOCK_CLOEXEC, SOCK_RAW,
+    AF_NETLINK, NETLINK_ROUTE, RTNLGRP_IPV4_ROUTE, RTNLGRP_IPV6_ROUTE, RTNLGRP_MPLS_ROUTE,
+    SOCK_CLOEXEC, SOCK_RAW, sockaddr_nl,
 };
 use netlink_packet_core::{
-    NetlinkHeader, NetlinkMessage, NetlinkPayload, NLM_F_ACK, NLM_F_CREATE, NLM_F_EXCL,
-    NLM_F_REQUEST,
+    NLM_F_ACK, NLM_F_CREATE, NLM_F_EXCL, NLM_F_REQUEST, NetlinkHeader, NetlinkMessage,
+    NetlinkPayload,
 };
 use netlink_packet_route::{
+    AddressFamily, RouteNetlinkMessage,
     route::{
         RouteAddress, RouteAttribute, RouteHeader, RouteMessage, RouteProtocol, RouteScope,
         RouteType,
     },
-    AddressFamily, RouteNetlinkMessage,
 };
 
-use crate::{syscall, Route, RouteAction, RouteChange};
+use crate::{Route, RouteAction, RouteChange, syscall};
 
 pub struct RouteSock(RawFd);
 
@@ -364,9 +364,5 @@ const fn nl_mgrp(group: u32) -> u32 {
         panic!("Use setsockopt NETLINK_ADD_MEMBERSHIP for this group");
     }
 
-    if group == 0 {
-        0
-    } else {
-        1 << (group - 1)
-    }
+    if group == 0 { 0 } else { 1 << (group - 1) }
 }
