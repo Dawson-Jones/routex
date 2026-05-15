@@ -9,8 +9,8 @@ use std::{
 use crate::{macos::rtmsg::m_rtmsg, syscall, Route, RouteAction, RouteChange};
 use libc::{
     pollfd, rt_msghdr, AF_INET, AF_INET6, AF_ROUTE, AF_UNSPEC, POLLIN, RTAX_MAX, RTA_DST,
-    RTA_GATEWAY, RTA_IFP, RTA_NETMASK, RTF_GATEWAY, RTF_STATIC, RTF_UP, RTM_ADD, RTM_DELETE,
-    RTM_GET, RTM_VERSION, SOCK_RAW,
+    RTA_GATEWAY, RTA_IFP, RTA_NETMASK, RTF_GATEWAY, RTF_HOST, RTF_STATIC, RTF_UP, RTM_ADD,
+    RTM_DELETE, RTM_GET, RTM_VERSION, SOCK_RAW,
 };
 
 const ROUTE_RESPONSE_TIMEOUT: Duration = Duration::from_millis(500);
@@ -54,15 +54,10 @@ impl RouteAction for RouteSock {
     fn add(&mut self, route: &Route) -> io::Result<()> {
         route.validate()?;
 
-        let mut rtm_flags = RTF_STATIC | RTF_UP;
-        if route.gateway.is_some() {
-            rtm_flags |= RTF_GATEWAY;
-        };
-
         let mut rtmsg = write_route_addrs(route, RouteRequestKind::Add);
         let seq = self.next_seq();
         rtmsg.hdr.rtm_type = RTM_ADD as u8;
-        rtmsg.hdr.rtm_flags = rtm_flags;
+        rtmsg.hdr.rtm_flags = route_flags(route, route.gateway.is_some());
         rtmsg.hdr.rtm_seq = seq;
         rtmsg.hdr.rtm_pid = unsafe { libc::getpid() };
         rtmsg.hdr.rtm_msglen = rtmsg.len() as u16;
@@ -82,11 +77,10 @@ impl RouteAction for RouteSock {
     fn delete(&mut self, route: &Route) -> io::Result<()> {
         route.validate()?;
 
-        let rtm_flags = RTF_STATIC | RTF_UP;
         let mut rtmsg = write_route_addrs(route, RouteRequestKind::Delete);
         let seq = self.next_seq();
         rtmsg.hdr.rtm_type = RTM_DELETE as u8;
-        rtmsg.hdr.rtm_flags = rtm_flags;
+        rtmsg.hdr.rtm_flags = route_flags(route, false);
         rtmsg.hdr.rtm_seq = seq;
         rtmsg.hdr.rtm_pid = unsafe { libc::getpid() };
         rtmsg.hdr.rtm_msglen = rtmsg.len() as u16;
@@ -115,11 +109,10 @@ impl RouteAction for RouteSock {
     fn get(&mut self, route: &Route) -> io::Result<Route> {
         route.validate()?;
 
-        let rtm_flags = RTF_STATIC | RTF_UP | RTF_GATEWAY;
         let mut rtmsg = write_route_addrs(route, RouteRequestKind::Query);
         let seq = self.next_seq();
         rtmsg.hdr.rtm_type = RTM_GET as u8;
-        rtmsg.hdr.rtm_flags = rtm_flags;
+        rtmsg.hdr.rtm_flags = route_flags(route, true);
         rtmsg.hdr.rtm_seq = seq;
         rtmsg.hdr.rtm_pid = unsafe { libc::getpid() };
         rtmsg.hdr.rtm_msglen = rtmsg.len() as u16;
@@ -291,13 +284,12 @@ fn write_route_addrs(route: &Route, kind: RouteRequestKind) -> m_rtmsg {
     }
     if matches!(kind, RouteRequestKind::Add) && route.gateway.is_none() && route.ifindex.is_some() {
         // `route add ... -interface ifname` is encoded as a link-layer gateway.
+        // The route CLI does not also send RTA_IFP for this path.
         rtmsg.hdr.rtm_addrs |= RTA_GATEWAY;
     }
     // Query asks the kernel to fill in IFP, so the slot must be reserved
     // even when the caller does not yet know the ifindex.
-    let request_ifp = matches!(kind, RouteRequestKind::Query)
-        || (matches!(kind, RouteRequestKind::Add) && route.ifindex.is_some());
-    if request_ifp {
+    if matches!(kind, RouteRequestKind::Query) {
         rtmsg.hdr.rtm_addrs |= RTA_IFP;
     }
 
@@ -323,6 +315,26 @@ fn write_route_addrs(route: &Route, kind: RouteRequestKind) -> m_rtmsg {
     }
 
     rtmsg
+}
+
+fn route_flags(route: &Route, gateway: bool) -> i32 {
+    let mut flags = RTF_STATIC | RTF_UP;
+
+    if is_host_route(route) {
+        flags |= RTF_HOST;
+    }
+    if gateway {
+        flags |= RTF_GATEWAY;
+    }
+
+    flags
+}
+
+fn is_host_route(route: &Route) -> bool {
+    match route.destination {
+        std::net::IpAddr::V4(_) => route.prefix == 32,
+        std::net::IpAddr::V6(_) => route.prefix == 128,
+    }
 }
 
 fn read_route(rtmsg: &mut m_rtmsg, n: usize) -> io::Result<Route> {
@@ -398,4 +410,59 @@ fn code2error(err: i32) -> io::Error {
     };
 
     io::Error::new(kind, format!("rtm_errno {}", err))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{IpAddr, Ipv4Addr};
+
+    use libc::sockaddr;
+
+    use super::*;
+
+    #[test]
+    fn add_by_interface_uses_link_gateway_without_ifp() {
+        let route = Route::new(IpAddr::V4(Ipv4Addr::new(1, 9, 4, 5)), 32).ifindex(4);
+
+        let rtmsg = write_route_addrs(&route, RouteRequestKind::Add);
+
+        assert_eq!(rtmsg.hdr.rtm_addrs, RTA_DST | RTA_GATEWAY | RTA_NETMASK);
+    }
+
+    #[test]
+    fn query_reserves_ifp_slot() {
+        let route = Route::new(IpAddr::V4(Ipv4Addr::new(1, 9, 4, 5)), 32);
+
+        let rtmsg = write_route_addrs(&route, RouteRequestKind::Query);
+
+        assert_eq!(rtmsg.hdr.rtm_addrs, RTA_DST | RTA_IFP);
+    }
+
+    #[test]
+    fn host_route_sets_host_flag() {
+        let route = Route::new(IpAddr::V4(Ipv4Addr::new(1, 9, 4, 5)), 32);
+
+        assert_ne!(route_flags(&route, false) & RTF_HOST, 0);
+    }
+
+    #[test]
+    fn netmask_sockaddr_is_compacted_like_route_cli() {
+        let route = Route::new(IpAddr::V4(Ipv4Addr::new(1, 9, 4, 5)), 24);
+
+        let rtmsg = write_route_addrs(&route, RouteRequestKind::Add);
+        let netmask = unsafe { &*(rtmsg.attr[16..].as_ptr() as *const sockaddr) };
+
+        assert_eq!(netmask.sa_len, 7);
+    }
+
+    #[test]
+    fn default_route_netmask_uses_empty_sockaddr_slot() {
+        let route = Route::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
+
+        let rtmsg = write_route_addrs(&route, RouteRequestKind::Add);
+        let netmask = unsafe { &*(rtmsg.attr[16..].as_ptr() as *const sockaddr) };
+
+        assert_eq!(netmask.sa_len, 0);
+        assert_eq!(rtmsg.attr_len, 20);
+    }
 }

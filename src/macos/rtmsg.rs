@@ -96,7 +96,19 @@ impl m_rtmsg {
     }
 
     pub fn put_netmask(&mut self, mask: &IpAddr) {
-        self.put_addr(mask)
+        let start = self.attr_len;
+
+        if is_zero_mask(mask) {
+            self.attr_len += roundup!(0);
+            return;
+        }
+
+        self.put_addr(mask);
+
+        let compact_len = compact_sockaddr_len(&self.attr[start..self.attr_len]);
+        let sa = unsafe { &mut *(self.attr[start..].as_mut_ptr() as *mut sockaddr) };
+        sa.sa_len = compact_len as u8;
+        self.attr_len = start + roundup!(compact_len);
     }
 
     pub fn get_addr(&mut self) -> IpAddr {
@@ -141,5 +153,19 @@ impl m_rtmsg {
         self.attr_len += roundup!(sa_dl.sdl_len as usize);
 
         sa_dl.sdl_index as u32
+    }
+}
+
+fn compact_sockaddr_len(bytes: &[i8]) -> usize {
+    bytes
+        .iter()
+        .rposition(|byte| *byte != 0)
+        .map_or(0, |pos| pos + 1)
+}
+
+fn is_zero_mask(mask: &IpAddr) -> bool {
+    match mask {
+        IpAddr::V4(addr) => addr.octets() == [0; 4],
+        IpAddr::V6(addr) => addr.octets() == [0; 16],
     }
 }
