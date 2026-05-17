@@ -15,6 +15,11 @@ use libc::{
 
 const ROUTE_RESPONSE_TIMEOUT: Duration = Duration::from_millis(500);
 
+/// `RTF_IFSCOPE` is the XNU flag that ties a route to a specific interface
+/// for use by `IP_BOUND_IF` scoped lookups. Not exposed by `libc`'s macOS
+/// bindings, so define it locally from the XNU value (`net/route.h`).
+const RTF_IFSCOPE: i32 = 0x1000000;
+
 pub struct RouteSock {
     fd: RawFd,
     seq: i32,
@@ -58,6 +63,7 @@ impl RouteAction for RouteSock {
         let seq = self.next_seq();
         rtmsg.hdr.rtm_type = RTM_ADD as u8;
         rtmsg.hdr.rtm_flags = route_flags(route, route.gateway.is_some());
+        apply_ifscope(&mut rtmsg.hdr, route);
         rtmsg.hdr.rtm_seq = seq;
         rtmsg.hdr.rtm_pid = unsafe { libc::getpid() };
         rtmsg.hdr.rtm_msglen = rtmsg.len() as u16;
@@ -81,6 +87,7 @@ impl RouteAction for RouteSock {
         let seq = self.next_seq();
         rtmsg.hdr.rtm_type = RTM_DELETE as u8;
         rtmsg.hdr.rtm_flags = route_flags(route, false);
+        apply_ifscope(&mut rtmsg.hdr, route);
         rtmsg.hdr.rtm_seq = seq;
         rtmsg.hdr.rtm_pid = unsafe { libc::getpid() };
         rtmsg.hdr.rtm_msglen = rtmsg.len() as u16;
@@ -113,6 +120,7 @@ impl RouteAction for RouteSock {
         let seq = self.next_seq();
         rtmsg.hdr.rtm_type = RTM_GET as u8;
         rtmsg.hdr.rtm_flags = route_flags(route, true);
+        apply_ifscope(&mut rtmsg.hdr, route);
         rtmsg.hdr.rtm_seq = seq;
         rtmsg.hdr.rtm_pid = unsafe { libc::getpid() };
         rtmsg.hdr.rtm_msglen = rtmsg.len() as u16;
@@ -193,15 +201,10 @@ impl RouteSock {
         let pid = unsafe { libc::getpid() };
         loop {
             let n = self.read(buf)?;
-            if n < std::mem::size_of::<rt_msghdr>() {
-                return Err(io::Error::other("invalid response"));
-            }
-
-            let hdr = unsafe { buf.as_ptr().cast::<rt_msghdr>().as_ref().unwrap() };
-            validate_header(hdr, None)?;
-            if hdr.rtm_pid != pid || hdr.rtm_seq != seq {
+            if !response_matches_ours(buf, n, pid, seq) {
                 continue;
             }
+            let hdr = unsafe { buf.as_ptr().cast::<rt_msghdr>().as_ref().unwrap() };
             validate_header(hdr, Some(expected_type))?;
             return Ok(n);
         }
@@ -240,15 +243,10 @@ impl RouteSock {
             }
 
             let n = self.read(buf)?;
-            if n < std::mem::size_of::<rt_msghdr>() {
-                return Err(io::Error::other("invalid response"));
-            }
-
-            let hdr = unsafe { buf.as_ptr().cast::<rt_msghdr>().as_ref().unwrap() };
-            validate_header(hdr, None)?;
-            if hdr.rtm_pid != pid || hdr.rtm_seq != seq {
+            if !response_matches_ours(buf, n, pid, seq) {
                 continue;
             }
+            let hdr = unsafe { buf.as_ptr().cast::<rt_msghdr>().as_ref().unwrap() };
             validate_header(hdr, Some(expected_type))?;
             return Ok(n);
         }
@@ -258,6 +256,19 @@ impl RouteSock {
         self.seq = self.seq.wrapping_add(1).max(1);
         self.seq
     }
+}
+
+/// True only when the message in `buf` is large enough to be a routing
+/// header and carries OUR `(pid, seq)`. Short broadcasts and replies for
+/// other route-socket listeners should make the caller keep reading, not
+/// bail out. Once a message is ours, version/type validation is a real
+/// protocol check and belongs in `validate_header`.
+fn response_matches_ours(buf: &[u8], n: usize, pid: i32, seq: i32) -> bool {
+    if n < std::mem::size_of::<rt_msghdr>() {
+        return false;
+    }
+    let hdr = unsafe { &*(buf.as_ptr().cast::<rt_msghdr>()) };
+    hdr.rtm_pid == pid && hdr.rtm_seq == seq
 }
 
 impl Drop for RouteSock {
@@ -330,6 +341,19 @@ fn route_flags(route: &Route, gateway: bool) -> i32 {
     flags
 }
 
+/// Apply `RTF_IFSCOPE` and `rtm_index` together for a scoped route. XNU
+/// encodes interface-scope in two coupled fields — the flag in
+/// `rtm_flags` and the ifindex in `rtm_msghdr.rtm_index` — so every
+/// request kind (ADD / DELETE / GET) needs to touch both or the kernel
+/// silently ignores the scope. Keep the coupling local to this helper
+/// so the two halves cannot drift again.
+fn apply_ifscope(hdr: &mut rt_msghdr, route: &Route) {
+    if let Some(scope) = route.scope_ifindex {
+        hdr.rtm_flags |= RTF_IFSCOPE;
+        hdr.rtm_index = scope as u16;
+    }
+}
+
 fn is_host_route(route: &Route) -> bool {
     match route.destination {
         std::net::IpAddr::V4(_) => route.prefix == 32,
@@ -368,6 +392,13 @@ fn read_route(rtmsg: &mut m_rtmsg, n: usize) -> io::Result<Route> {
             RTA_IFP => ret.ifindex = Some(rtmsg.get_index()),
             _ => {}
         }
+    }
+
+    // Scope lives outside the sockaddr table: the flag is in `rtm_flags`
+    // and the bound ifindex is in `rt_msghdr.rtm_index`. Reading them
+    // back keeps round-trips (`add` -> `get`, `monitor` events) lossless.
+    if rtmsg.hdr.rtm_flags & RTF_IFSCOPE != 0 {
+        ret.scope_ifindex = Some(rtmsg.hdr.rtm_index as u32);
     }
 
     rtmsg.attr_len = 0;
@@ -464,5 +495,104 @@ mod tests {
 
         assert_eq!(netmask.sa_len, 0);
         assert_eq!(rtmsg.attr_len, 20);
+    }
+
+    #[test]
+    fn apply_ifscope_sets_both_flag_and_index() {
+        let route = Route::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+            .gateway(IpAddr::V4(Ipv4Addr::new(192, 168, 0, 1)))
+            .ifscope(7);
+
+        let mut rtmsg = m_rtmsg::default();
+        rtmsg.hdr.rtm_flags = route_flags(&route, true);
+        apply_ifscope(&mut rtmsg.hdr, &route);
+
+        assert_ne!(rtmsg.hdr.rtm_flags & RTF_IFSCOPE, 0);
+        assert_eq!(rtmsg.hdr.rtm_index, 7);
+    }
+
+    #[test]
+    fn apply_ifscope_no_scope_leaves_header_untouched() {
+        let route = Route::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+            .gateway(IpAddr::V4(Ipv4Addr::new(192, 168, 0, 1)));
+
+        let mut rtmsg = m_rtmsg::default();
+        rtmsg.hdr.rtm_flags = route_flags(&route, true);
+        apply_ifscope(&mut rtmsg.hdr, &route);
+
+        assert_eq!(rtmsg.hdr.rtm_flags & RTF_IFSCOPE, 0);
+        assert_eq!(rtmsg.hdr.rtm_index, 0);
+    }
+
+    #[test]
+    fn read_route_preserves_scope() {
+        let mut rtmsg = m_rtmsg::default();
+        rtmsg.hdr.rtm_flags = RTF_IFSCOPE;
+        rtmsg.hdr.rtm_index = 11;
+        // No sockaddr table — RTA bits are all zero, so read_route just
+        // sees the scope metadata in the header.
+        rtmsg.hdr.rtm_addrs = 0;
+
+        let route = read_route(&mut rtmsg, std::mem::size_of::<rt_msghdr>()).unwrap();
+        assert_eq!(route.scope_ifindex, Some(11));
+    }
+
+    #[test]
+    fn read_route_without_scope_returns_none() {
+        let mut rtmsg = m_rtmsg::default();
+        rtmsg.hdr.rtm_flags = 0;
+        rtmsg.hdr.rtm_index = 42;
+        rtmsg.hdr.rtm_addrs = 0;
+
+        let route = read_route(&mut rtmsg, std::mem::size_of::<rt_msghdr>()).unwrap();
+        assert_eq!(route.scope_ifindex, None);
+    }
+
+    #[test]
+    fn response_filter_rejects_short_read_and_mismatch_but_accepts_our_reply() {
+        let mut rtmsg = m_rtmsg::default();
+        rtmsg.hdr.rtm_pid = 42;
+        rtmsg.hdr.rtm_seq = 7;
+        let buf = unsafe {
+            std::slice::from_raw_parts(
+                &rtmsg as *const m_rtmsg as *const u8,
+                std::mem::size_of::<m_rtmsg>(),
+            )
+        };
+
+        // Short read: not enough bytes for a header — skip.
+        assert!(!response_matches_ours(buf, 4, 42, 7));
+        // Foreign reply (different pid): skip.
+        assert!(!response_matches_ours(
+            buf,
+            std::mem::size_of::<rt_msghdr>(),
+            99,
+            7,
+        ));
+        // Bad version is still OUR reply. Accept it here so validate_header
+        // reports the protocol error instead of looping forever.
+        let mut bad_ver = m_rtmsg::default();
+        bad_ver.hdr.rtm_version = (RTM_VERSION as u8).wrapping_add(1);
+        bad_ver.hdr.rtm_pid = 42;
+        bad_ver.hdr.rtm_seq = 7;
+        let bad_buf = unsafe {
+            std::slice::from_raw_parts(
+                &bad_ver as *const m_rtmsg as *const u8,
+                std::mem::size_of::<rt_msghdr>(),
+            )
+        };
+        assert!(response_matches_ours(
+            bad_buf,
+            std::mem::size_of::<rt_msghdr>(),
+            42,
+            7,
+        ));
+        // Our reply: accept.
+        assert!(response_matches_ours(
+            buf,
+            std::mem::size_of::<rt_msghdr>(),
+            42,
+            7,
+        ));
     }
 }

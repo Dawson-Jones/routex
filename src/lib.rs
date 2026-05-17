@@ -36,6 +36,13 @@ pub struct Route {
     pub prefix: u8,
     pub gateway: Option<IpAddr>,
     pub ifindex: Option<u32>,
+    /// macOS interface-scoped routing (`RTF_IFSCOPE`). When set, the route
+    /// is only matched by lookups whose `IP_BOUND_IF` scope equals this
+    /// ifindex. Used to install a per-interface copy of the default route so
+    /// that physical-NIC-bound sockets can still reach the internet after a
+    /// VPN's `0/1` + `128/1` routes have taken the unscoped default. Linux
+    /// and Windows backends ignore this field.
+    pub scope_ifindex: Option<u32>,
 }
 
 impl Default for Route {
@@ -47,6 +54,7 @@ impl Default for Route {
             prefix: 0,
             gateway: None,
             ifindex: None,
+            scope_ifindex: None,
         }
     }
 }
@@ -58,6 +66,7 @@ impl Route {
             prefix,
             gateway: None,
             ifindex: None,
+            scope_ifindex: None,
         }
     }
 
@@ -126,6 +135,14 @@ impl Route {
 
     pub fn ifindex(mut self, ifindex: u32) -> Route {
         self.ifindex = Some(ifindex);
+        self
+    }
+
+    /// macOS-only: scope this route to a specific interface (`RTF_IFSCOPE`).
+    /// No-op on Linux/Windows backends.
+    #[cfg(target_os = "macos")]
+    pub fn ifscope(mut self, ifindex: u32) -> Route {
+        self.scope_ifindex = Some(ifindex);
         self
     }
 
