@@ -182,6 +182,11 @@ pub fn if_nametoindex(name: &str) -> Option<u32> {
     (ifindex != 0).then_some(ifindex)
 }
 
+#[cfg(target_os = "windows")]
+pub fn if_friendly_name_to_index(name: &str) -> Option<u32> {
+    windows::if_friendly_name_to_index(name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

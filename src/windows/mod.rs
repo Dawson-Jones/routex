@@ -6,15 +6,18 @@ use std::{
 
 use windows_sys::Win32::{
     Foundation::{
-        ERROR_FILE_NOT_FOUND, ERROR_NOT_FOUND, ERROR_OBJECT_ALREADY_EXISTS, ERROR_SUCCESS,
+        ERROR_BUFFER_OVERFLOW, ERROR_FILE_NOT_FOUND, ERROR_NOT_FOUND, ERROR_OBJECT_ALREADY_EXISTS,
+        ERROR_SUCCESS,
     },
     NetworkManagement::IpHelper::{
-        CreateIpForwardEntry2, DeleteIpForwardEntry2, FreeMibTable, GetBestRoute2,
-        GetIpForwardTable2, InitializeIpForwardEntry, MIB_IPFORWARD_ROW2, MIB_IPFORWARD_TABLE2,
+        CreateIpForwardEntry2, DeleteIpForwardEntry2, FreeMibTable,
+        GAA_FLAG_INCLUDE_ALL_INTERFACES, GetAdaptersAddresses, GetBestRoute2, GetIpForwardTable2,
+        IP_ADAPTER_ADDRESSES_LH, InitializeIpForwardEntry, MIB_IPFORWARD_ROW2,
+        MIB_IPFORWARD_TABLE2,
     },
     Networking::WinSock::{
-        ADDRESS_FAMILY, AF_INET, AF_INET6, IN_ADDR, IN_ADDR_0, IN6_ADDR, MIB_IPPROTO_NETMGMT,
-        NlroManual, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_INET,
+        ADDRESS_FAMILY, AF_INET, AF_INET6, AF_UNSPEC, IN_ADDR, IN_ADDR_0, IN6_ADDR,
+        MIB_IPPROTO_NETMGMT, NlroManual, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_INET,
     },
 };
 
@@ -69,6 +72,17 @@ impl RouteAction for RouteSock {
             "Windows route monitoring is not implemented",
         ))
     }
+}
+
+pub(crate) fn if_friendly_name_to_index(name: &str) -> Option<u32> {
+    let table = AdapterAddressTable::new().ok()?;
+    let target = name.to_lowercase();
+
+    table.rows().find_map(|row| {
+        let friendly_name = unsafe { wide_ptr_to_string(row.FriendlyName) }?;
+        (friendly_name.to_lowercase() == target)
+            .then(|| unsafe { row.Anonymous1.Anonymous.IfIndex })
+    })
 }
 
 fn route_row(route: &Route) -> MIB_IPFORWARD_ROW2 {
@@ -248,4 +262,66 @@ impl Drop for RouteTable {
     fn drop(&mut self) {
         unsafe { FreeMibTable(self.ptr.cast()) };
     }
+}
+
+struct AdapterAddressTable {
+    buf: Vec<u8>,
+}
+
+impl AdapterAddressTable {
+    fn new() -> io::Result<Self> {
+        let mut len = 15_000u32;
+        loop {
+            let mut buf = vec![0u8; len as usize];
+            let code = unsafe {
+                GetAdaptersAddresses(
+                    AF_UNSPEC as u32,
+                    GAA_FLAG_INCLUDE_ALL_INTERFACES,
+                    ptr::null(),
+                    buf.as_mut_ptr().cast(),
+                    &mut len,
+                )
+            };
+            match code {
+                ERROR_SUCCESS => return Ok(Self { buf }),
+                ERROR_BUFFER_OVERFLOW => continue,
+                _ => return Err(io::Error::from_raw_os_error(code as i32)),
+            }
+        }
+    }
+
+    fn rows(&self) -> AdapterAddressRows<'_> {
+        AdapterAddressRows {
+            next: self.buf.as_ptr().cast(),
+            _table: self,
+        }
+    }
+}
+
+struct AdapterAddressRows<'a> {
+    next: *const IP_ADAPTER_ADDRESSES_LH,
+    _table: &'a AdapterAddressTable,
+}
+
+impl<'a> Iterator for AdapterAddressRows<'a> {
+    type Item = &'a IP_ADAPTER_ADDRESSES_LH;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let row = unsafe { self.next.as_ref()? };
+        self.next = row.Next;
+        Some(row)
+    }
+}
+
+unsafe fn wide_ptr_to_string(ptr: windows_sys::core::PWSTR) -> Option<String> {
+    if ptr.is_null() {
+        return None;
+    }
+    let mut len = 0usize;
+    while unsafe { *ptr.add(len) } != 0 {
+        len += 1;
+    }
+    Some(String::from_utf16_lossy(unsafe {
+        std::slice::from_raw_parts(ptr, len)
+    }))
 }
