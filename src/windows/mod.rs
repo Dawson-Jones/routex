@@ -1,5 +1,6 @@
 use std::{
     io,
+    mem::MaybeUninit,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     ptr,
 };
@@ -12,8 +13,8 @@ use windows_sys::Win32::{
     NetworkManagement::IpHelper::{
         CreateIpForwardEntry2, DeleteIpForwardEntry2, FreeMibTable,
         GAA_FLAG_INCLUDE_ALL_INTERFACES, GetAdaptersAddresses, GetBestRoute2, GetIpForwardTable2,
-        IP_ADAPTER_ADDRESSES_LH, InitializeIpForwardEntry, MIB_IPFORWARD_ROW2,
-        MIB_IPFORWARD_TABLE2,
+        GetIpInterfaceEntry, IP_ADAPTER_ADDRESSES_LH, InitializeIpForwardEntry,
+        InitializeIpInterfaceEntry, MIB_IPFORWARD_ROW2, MIB_IPFORWARD_TABLE2, MIB_IPINTERFACE_ROW,
     },
     Networking::WinSock::{
         ADDRESS_FAMILY, AF_INET, AF_INET6, AF_UNSPEC, IN_ADDR, IN_ADDR_0, IN6_ADDR,
@@ -48,7 +49,7 @@ impl RouteAction for RouteSock {
     fn delete(&mut self, route: &Route) -> io::Result<()> {
         route.validate()?;
 
-        let row = find_route(route)?;
+        let row = find_unique_route(route)?;
         win32_result(unsafe { DeleteIpForwardEntry2(&row) })
     }
 
@@ -57,7 +58,7 @@ impl RouteAction for RouteSock {
 
         // GetBestRoute2 treats an unspecified destination as a lookup target, not as "show default route".
         let row = if route.destination.is_unspecified() && route.prefix == 0 {
-            find_route(route)?
+            best_matching_route(route)?
         } else {
             best_route(route.destination, route.ifindex.unwrap_or(0))?
         };
@@ -80,9 +81,16 @@ pub(crate) fn if_friendly_name_to_index(name: &str) -> Option<u32> {
 
     table.rows().find_map(|row| {
         let friendly_name = unsafe { wide_ptr_to_string(row.FriendlyName) }?;
-        (friendly_name.to_lowercase() == target)
-            .then(|| unsafe { row.Anonymous1.Anonymous.IfIndex })
+        (friendly_name.to_lowercase() == target).then(|| {
+            preferred_adapter_index(unsafe { row.Anonymous1.Anonymous.IfIndex }, row.Ipv6IfIndex)
+        })?
     })
+}
+
+fn preferred_adapter_index(ipv4_index: u32, ipv6_index: u32) -> Option<u32> {
+    (ipv4_index != 0)
+        .then_some(ipv4_index)
+        .or_else(|| (ipv6_index != 0).then_some(ipv6_index))
 }
 
 fn route_row(route: &Route) -> MIB_IPFORWARD_ROW2 {
@@ -102,17 +110,51 @@ fn route_row(route: &Route) -> MIB_IPFORWARD_ROW2 {
     row
 }
 
-fn find_route(route: &Route) -> io::Result<MIB_IPFORWARD_ROW2> {
+fn find_unique_route(route: &Route) -> io::Result<MIB_IPFORWARD_ROW2> {
     let table = RouteTable::new(address_family(route.destination))?;
-
-    // TODO: Windows deletes match the concrete row. Without gateway/ifindex this keeps the
-    // current Route API semantics by taking the first prefix match, which can be ambiguous.
-    table
+    let mut matches = table
         .rows()
         .iter()
         .copied()
-        .find(|row| row_matches(row, route))
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "route not found"))
+        .filter(|row| row.ValidLifetime != 0 && row_matches(row, route));
+    let route = matches
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "route not found"))?;
+
+    if matches.next().is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "route selector is ambiguous; specify gateway and interface index",
+        ));
+    }
+
+    Ok(route)
+}
+
+fn best_matching_route(route: &Route) -> io::Result<MIB_IPFORWARD_ROW2> {
+    let table = RouteTable::new(address_family(route.destination))?;
+    let mut best = None;
+
+    for row in table
+        .rows()
+        .iter()
+        .copied()
+        .filter(|row| row.ValidLifetime != 0 && row_matches(row, route))
+    {
+        let interface_metric = match interface_metric(&row) {
+            Ok(Some(metric)) => metric,
+            Ok(None) => continue,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        let rank = route_rank(&row, interface_metric);
+        if best.as_ref().is_none_or(|(best_rank, _)| rank < *best_rank) {
+            best = Some((rank, row));
+        }
+    }
+
+    best.map(|(_, row)| row)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no usable route found"))
 }
 
 fn row_matches(row: &MIB_IPFORWARD_ROW2, route: &Route) -> bool {
@@ -144,6 +186,44 @@ fn best_route(destination: IpAddr, interface_index: u32) -> io::Result<MIB_IPFOR
     })?;
 
     Ok(best_route)
+}
+
+fn interface_metric(route: &MIB_IPFORWARD_ROW2) -> io::Result<Option<u32>> {
+    let mut interface = MIB_IPINTERFACE_ROW::default();
+    unsafe { InitializeIpInterfaceEntry(&mut interface) };
+    interface.Family = address_family(sockaddr_ip(route.DestinationPrefix.Prefix));
+    interface.InterfaceLuid = route.InterfaceLuid;
+    interface.InterfaceIndex = route.InterfaceIndex;
+    win32_result(unsafe { GetIpInterfaceEntry(&mut interface) })?;
+
+    Ok(usable_interface_metric(&interface))
+}
+
+fn usable_interface_metric(interface: &MIB_IPINTERFACE_ROW) -> Option<u32> {
+    (interface.Connected && !interface.DisableDefaultRoutes).then_some(interface.Metric)
+}
+
+fn route_rank(
+    route: &MIB_IPFORWARD_ROW2,
+    interface_metric: u32,
+) -> (u64, u32, u32, (u8, [u8; 16])) {
+    (
+        u64::from(route.Metric) + u64::from(interface_metric),
+        route.Metric,
+        route.InterfaceIndex,
+        ip_sort_key(sockaddr_ip(route.NextHop)),
+    )
+}
+
+fn ip_sort_key(address: IpAddr) -> (u8, [u8; 16]) {
+    match address {
+        IpAddr::V4(address) => {
+            let mut bytes = [0; 16];
+            bytes[..4].copy_from_slice(&address.octets());
+            (4, bytes)
+        }
+        IpAddr::V6(address) => (6, address.octets()),
+    }
 }
 
 fn resolve_interface_index(route: &Route) -> io::Result<u32> {
@@ -265,14 +345,14 @@ impl Drop for RouteTable {
 }
 
 struct AdapterAddressTable {
-    buf: Vec<u8>,
+    buf: Vec<MaybeUninit<IP_ADAPTER_ADDRESSES_LH>>,
 }
 
 impl AdapterAddressTable {
     fn new() -> io::Result<Self> {
         let mut len = 15_000u32;
         loop {
-            let mut buf = vec![0u8; len as usize];
+            let mut buf = aligned_adapter_buffer(len as usize);
             let code = unsafe {
                 GetAdaptersAddresses(
                     AF_UNSPEC as u32,
@@ -296,6 +376,11 @@ impl AdapterAddressTable {
             _table: self,
         }
     }
+}
+
+fn aligned_adapter_buffer(byte_len: usize) -> Vec<MaybeUninit<IP_ADAPTER_ADDRESSES_LH>> {
+    let entry_size = std::mem::size_of::<IP_ADAPTER_ADDRESSES_LH>();
+    vec![MaybeUninit::uninit(); byte_len.div_ceil(entry_size)]
 }
 
 struct AdapterAddressRows<'a> {
@@ -324,4 +409,73 @@ unsafe fn wide_ptr_to_string(ptr: windows_sys::core::PWSTR) -> Option<String> {
     Some(String::from_utf16_lossy(unsafe {
         std::slice::from_raw_parts(ptr, len)
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(metric: u32, interface_index: u32, gateway: Ipv4Addr) -> MIB_IPFORWARD_ROW2 {
+        MIB_IPFORWARD_ROW2 {
+            Metric: metric,
+            InterfaceIndex: interface_index,
+            NextHop: sockaddr(IpAddr::V4(gateway)),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn route_rank_uses_route_plus_interface_metric() {
+        let low_route_metric = row(5, 2, Ipv4Addr::new(10, 0, 0, 2));
+        let low_effective_metric = row(15, 3, Ipv4Addr::new(10, 0, 0, 3));
+
+        assert!(route_rank(&low_effective_metric, 5) < route_rank(&low_route_metric, 50));
+    }
+
+    #[test]
+    fn route_rank_breaks_equal_metric_ties_deterministically() {
+        let first = row(10, 2, Ipv4Addr::new(10, 0, 0, 2));
+        let second = row(10, 3, Ipv4Addr::new(10, 0, 0, 1));
+
+        assert!(route_rank(&first, 10) < route_rank(&second, 10));
+    }
+
+    #[test]
+    fn adapter_address_storage_has_the_required_alignment() {
+        let buffer = aligned_adapter_buffer(15_000);
+
+        assert_eq!(
+            buffer.as_ptr() as usize % std::mem::align_of::<IP_ADAPTER_ADDRESSES_LH>(),
+            0
+        );
+    }
+
+    #[test]
+    fn adapter_index_prefers_ipv4_and_falls_back_to_ipv6() {
+        assert_eq!(preferred_adapter_index(4, 6), Some(4));
+        assert_eq!(preferred_adapter_index(0, 6), Some(6));
+        assert_eq!(preferred_adapter_index(0, 0), None);
+    }
+
+    #[test]
+    fn default_route_requires_an_enabled_connected_interface() {
+        let usable = MIB_IPINTERFACE_ROW {
+            Connected: true,
+            DisableDefaultRoutes: false,
+            Metric: 10,
+            ..Default::default()
+        };
+        let disconnected = MIB_IPINTERFACE_ROW {
+            Connected: false,
+            ..usable
+        };
+        let default_routes_disabled = MIB_IPINTERFACE_ROW {
+            DisableDefaultRoutes: true,
+            ..usable
+        };
+
+        assert_eq!(usable_interface_metric(&usable), Some(10));
+        assert_eq!(usable_interface_metric(&disconnected), None);
+        assert_eq!(usable_interface_metric(&default_routes_disabled), None);
+    }
 }

@@ -1,7 +1,7 @@
-use std::net::IpAddr;
+use std::{io, net::IpAddr};
 
 use libc::{
-    AF_INET, AF_INET6, AF_LINK, RTM_VERSION, in_addr, in6_addr, rt_msghdr, sockaddr, sockaddr_dl,
+    AF_INET, AF_INET6, AF_LINK, RTM_VERSION, in_addr, in6_addr, rt_msghdr, sockaddr_dl,
     sockaddr_in, sockaddr_in6,
 };
 
@@ -44,37 +44,87 @@ impl m_rtmsg {
         std::mem::size_of::<rt_msghdr>() + self.attr_len
     }
 
+    pub fn parse(bytes: &[u8]) -> io::Result<Self> {
+        let header_len = std::mem::size_of::<rt_msghdr>();
+        if bytes.len() < header_len {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "truncated routing message header",
+            ));
+        }
+
+        // Routing sockets return byte buffers with no Rust alignment
+        // guarantee. Copy the wire header into an owned, aligned value before
+        // inspecting any fields.
+        let hdr = unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast::<rt_msghdr>()) };
+        let message_len = hdr.rtm_msglen as usize;
+        if message_len < header_len || message_len > bytes.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "invalid routing message length {message_len} for {} received bytes",
+                    bytes.len()
+                ),
+            ));
+        }
+
+        let attr_len = message_len - header_len;
+        if attr_len > 2048 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("routing message attributes exceed capacity: {attr_len}"),
+            ));
+        }
+
+        let mut message = Self {
+            hdr,
+            ..Self::default()
+        };
+        message.attr[..attr_len].copy_from_slice(unsafe {
+            std::slice::from_raw_parts(bytes[header_len..message_len].as_ptr().cast(), attr_len)
+        });
+        Ok(message)
+    }
+
     fn put_addr(&mut self, addr: &IpAddr) {
         match addr {
             IpAddr::V4(addr) => {
                 let sa_len = std::mem::size_of::<sockaddr_in>();
-                let sa_in =
-                    unsafe { &mut *(self.attr[self.attr_len..].as_mut_ptr() as *mut sockaddr_in) };
-                sa_in.sin_len = sa_len as u8;
-                sa_in.sin_family = AF_INET as u8;
-                sa_in.sin_port = 0;
-                sa_in.sin_addr = in_addr {
-                    s_addr: u32::from_ne_bytes(addr.octets()),
+                let sa_in = sockaddr_in {
+                    sin_len: sa_len as u8,
+                    sin_family: AF_INET as u8,
+                    sin_port: 0,
+                    sin_addr: in_addr {
+                        s_addr: u32::from_ne_bytes(addr.octets()),
+                    },
+                    sin_zero: [0; 8],
                 };
-
-                self.attr_len += sa_len;
+                self.write_value(sa_in);
             }
             IpAddr::V6(addr) => {
                 let sa_len = std::mem::size_of::<sockaddr_in6>();
-                let sa_in6 =
-                    unsafe { &mut *(self.attr[self.attr_len..].as_mut_ptr() as *mut sockaddr_in6) };
-                sa_in6.sin6_len = sa_len as u8;
-                sa_in6.sin6_family = AF_INET6 as u8;
-                sa_in6.sin6_port = 0;
-                sa_in6.sin6_flowinfo = 0;
-                sa_in6.sin6_addr = in6_addr {
-                    s6_addr: addr.octets(),
+                let sa_in6 = sockaddr_in6 {
+                    sin6_len: sa_len as u8,
+                    sin6_family: AF_INET6 as u8,
+                    sin6_port: 0,
+                    sin6_flowinfo: 0,
+                    sin6_addr: in6_addr {
+                        s6_addr: addr.octets(),
+                    },
+                    sin6_scope_id: 0,
                 };
-                sa_in6.sin6_scope_id = 0;
-
-                self.attr_len += sa_len;
+                self.write_value(sa_in6);
             }
         }
+    }
+
+    fn write_value<T: Copy>(&mut self, value: T) {
+        let len = std::mem::size_of::<T>();
+        assert!(self.attr_len + len <= self.attr.len());
+        unsafe {
+            std::ptr::write_unaligned(self.attr[self.attr_len..].as_mut_ptr().cast::<T>(), value);
+        }
+        self.attr_len += len;
     }
 
     pub fn put_destination(&mut self, dest: &IpAddr) {
@@ -87,12 +137,11 @@ impl m_rtmsg {
 
     pub fn put_index(&mut self, ifindex: u32) {
         let sdl_len = std::mem::size_of::<sockaddr_dl>();
-        let sa_dl = unsafe { &mut *(self.attr[self.attr_len..].as_mut_ptr() as *mut sockaddr_dl) };
+        let mut sa_dl = unsafe { std::mem::zeroed::<sockaddr_dl>() };
         sa_dl.sdl_len = sdl_len as u8;
         sa_dl.sdl_family = AF_LINK as u8;
         sa_dl.sdl_index = ifindex as u16;
-
-        self.attr_len += sdl_len;
+        self.write_value(sa_dl);
     }
 
     pub fn put_netmask(&mut self, mask: &IpAddr) {
@@ -106,53 +155,97 @@ impl m_rtmsg {
         self.put_addr(mask);
 
         let compact_len = compact_sockaddr_len(&self.attr[start..self.attr_len]);
-        let sa = unsafe { &mut *(self.attr[start..].as_mut_ptr() as *mut sockaddr) };
-        sa.sa_len = compact_len as u8;
+        self.attr[start] = compact_len as i8;
         self.attr_len = start + roundup!(compact_len);
     }
 
-    pub fn get_addr(&mut self) -> IpAddr {
-        let sa_ptr = self.attr[self.attr_len..].as_ptr() as *const sockaddr;
+    fn next_sockaddr(&mut self) -> io::Result<[u8; 128]> {
+        let header_len = std::mem::size_of::<rt_msghdr>();
+        let attributes_len = (self.hdr.rtm_msglen as usize)
+            .checked_sub(header_len)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid message length"))?;
+        if self.attr_len >= attributes_len {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "missing routing sockaddr",
+            ));
+        }
 
-        unsafe {
-            if (*sa_ptr).sa_family == AF_INET as u8 {
-                let sa_in_ptr = sa_ptr as *const sockaddr_in;
-                let sa_in = &*sa_in_ptr;
+        let sockaddr_len = self.attr[self.attr_len] as u8 as usize;
+        if sockaddr_len > 128 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsupported sockaddr length {sockaddr_len}"),
+            ));
+        }
+        let slot_len = roundup!(sockaddr_len);
+        let end = self
+            .attr_len
+            .checked_add(slot_len)
+            .filter(|end| *end <= attributes_len)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::UnexpectedEof, "truncated routing sockaddr")
+            })?;
 
-                self.attr_len += roundup!(sa_in.sin_len as usize);
+        let mut bytes = [0; 128];
+        bytes[..sockaddr_len].copy_from_slice(unsafe {
+            std::slice::from_raw_parts(self.attr[self.attr_len..].as_ptr().cast(), sockaddr_len)
+        });
+        self.attr_len = end;
+        Ok(bytes)
+    }
 
-                IpAddr::from(sa_in.sin_addr.s_addr.to_ne_bytes())
-            } else {
-                let sa_in6_ptr = sa_ptr as *const sockaddr_in6;
-                let sa_in6 = &*sa_in6_ptr;
+    fn get_addr(&mut self, family: Option<u8>) -> io::Result<IpAddr> {
+        let mut bytes = self.next_sockaddr()?;
+        if let Some(family) = family {
+            bytes[1] = family;
+        }
 
-                self.attr_len += roundup!(sa_in6.sin6_len as usize);
-
-                IpAddr::from(sa_in6.sin6_addr.s6_addr)
+        match bytes[1] {
+            family if family == AF_INET as u8 => {
+                let addr =
+                    unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast::<sockaddr_in>()) };
+                Ok(IpAddr::from(addr.sin_addr.s_addr.to_ne_bytes()))
             }
+            family if family == AF_INET6 as u8 => {
+                let addr =
+                    unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast::<sockaddr_in6>()) };
+                Ok(IpAddr::from(addr.sin6_addr.s6_addr))
+            }
+            family => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsupported sockaddr family {family}"),
+            )),
         }
     }
 
-    pub fn get_destination(&mut self) -> IpAddr {
-        self.get_addr()
+    pub fn get_destination(&mut self) -> io::Result<IpAddr> {
+        self.get_addr(None)
     }
 
-    pub fn get_gateway(&mut self) -> IpAddr {
-        self.get_addr()
+    pub fn get_gateway(&mut self) -> io::Result<IpAddr> {
+        self.get_addr(None)
     }
 
-    pub fn get_netmask(&mut self, family: u8) -> IpAddr {
-        let sa = unsafe { &mut *(self.attr[self.attr_len..].as_ptr() as *mut sockaddr) };
-        sa.sa_family = family;
-
-        self.get_addr()
+    pub fn get_netmask(&mut self, family: u8) -> io::Result<IpAddr> {
+        self.get_addr(Some(family))
     }
 
-    pub fn get_index(&mut self) -> u32 {
-        let sa_dl = unsafe { &mut *(self.attr[self.attr_len..].as_ptr() as *mut sockaddr_dl) };
-        self.attr_len += roundup!(sa_dl.sdl_len as usize);
+    pub fn get_index(&mut self) -> io::Result<u32> {
+        let bytes = self.next_sockaddr()?;
+        if bytes[1] != AF_LINK as u8 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("expected link sockaddr, found family {}", bytes[1]),
+            ));
+        }
+        let addr = unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast::<sockaddr_dl>()) };
 
-        sa_dl.sdl_index as u32
+        Ok(addr.sdl_index as u32)
+    }
+
+    pub fn skip_addr(&mut self) -> io::Result<()> {
+        self.next_sockaddr().map(|_| ())
     }
 }
 

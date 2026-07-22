@@ -3,26 +3,24 @@ mod rtmsg;
 use std::{
     io::{self, Read, Write},
     os::fd::{AsRawFd, RawFd},
-    time::{Duration, Instant},
+    sync::atomic::{AtomicI32, Ordering},
 };
 
-use crate::{Route, RouteAction, RouteChange, macos::rtmsg::m_rtmsg, syscall};
+use crate::{Route, RouteAction, RouteChange, macos::rtmsg::m_rtmsg};
 use libc::{
-    AF_INET, AF_INET6, AF_ROUTE, AF_UNSPEC, POLLIN, RTA_DST, RTA_GATEWAY, RTA_IFP, RTA_NETMASK,
-    RTAX_MAX, RTF_GATEWAY, RTF_HOST, RTF_STATIC, RTF_UP, RTM_ADD, RTM_DELETE, RTM_GET, RTM_VERSION,
-    SOCK_RAW, pollfd, rt_msghdr,
+    AF_INET, AF_INET6, AF_ROUTE, AF_UNSPEC, RTA_DST, RTA_GATEWAY, RTA_IFP, RTA_NETMASK, RTAX_MAX,
+    RTF_GATEWAY, RTF_HOST, RTF_STATIC, RTF_UP, RTM_ADD, RTM_CHANGE, RTM_DELETE, RTM_GET,
+    RTM_VERSION, SO_USELOOPBACK, SOCK_RAW, SOL_SOCKET, rt_msghdr,
 };
-
-const ROUTE_RESPONSE_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// `RTF_IFSCOPE` is the XNU flag that ties a route to a specific interface
 /// for use by `IP_BOUND_IF` scoped lookups. Not exposed by `libc`'s macOS
 /// bindings, so define it locally from the XNU value (`net/route.h`).
 const RTF_IFSCOPE: i32 = 0x1000000;
+static ROUTE_SEQUENCE: AtomicI32 = AtomicI32::new(0);
 
 pub struct RouteSock {
     fd: RawFd,
-    seq: i32,
 }
 
 impl AsRawFd for RouteSock {
@@ -60,7 +58,7 @@ impl RouteAction for RouteSock {
         route.validate()?;
 
         let mut rtmsg = write_route_addrs(route, RouteRequestKind::Add);
-        let seq = self.next_seq();
+        let seq = next_route_sequence();
         rtmsg.hdr.rtm_type = RTM_ADD as u8;
         rtmsg.hdr.rtm_flags = route_flags(route, route.gateway.is_some());
         apply_ifscope(&mut rtmsg.hdr, route);
@@ -69,14 +67,6 @@ impl RouteAction for RouteSock {
         rtmsg.hdr.rtm_msglen = rtmsg.len() as u16;
 
         self.write_all(route_msg_bytes(&rtmsg))?;
-
-        let mut buf = [0; std::mem::size_of::<m_rtmsg>()];
-        let rt_hdr = self.read_request_response(&mut buf, seq, RTM_ADD as u8)?;
-
-        if rt_hdr.rtm_errno != 0 {
-            return Err(code2error(rt_hdr.rtm_errno));
-        }
-
         Ok(())
     }
 
@@ -84,7 +74,7 @@ impl RouteAction for RouteSock {
         route.validate()?;
 
         let mut rtmsg = write_route_addrs(route, RouteRequestKind::Delete);
-        let seq = self.next_seq();
+        let seq = next_route_sequence();
         rtmsg.hdr.rtm_type = RTM_DELETE as u8;
         rtmsg.hdr.rtm_flags = route_flags(route, false);
         apply_ifscope(&mut rtmsg.hdr, route);
@@ -93,23 +83,6 @@ impl RouteAction for RouteSock {
         rtmsg.hdr.rtm_msglen = rtmsg.len() as u16;
 
         self.write_all(route_msg_bytes(&rtmsg))?;
-
-        let mut buf = [0; std::mem::size_of::<m_rtmsg>()];
-        let rt_hdr = match self.read_request_response_timeout(
-            &mut buf,
-            seq,
-            RTM_DELETE as u8,
-            ROUTE_RESPONSE_TIMEOUT,
-        ) {
-            Ok(rt_hdr) => rt_hdr,
-            Err(error) if error.kind() == io::ErrorKind::TimedOut => return Ok(()),
-            Err(error) => return Err(error),
-        };
-
-        if rt_hdr.rtm_errno != 0 {
-            return Err(code2error(rt_hdr.rtm_errno));
-        }
-
         Ok(())
     }
 
@@ -117,7 +90,7 @@ impl RouteAction for RouteSock {
         route.validate()?;
 
         let mut rtmsg = write_route_addrs(route, RouteRequestKind::Query);
-        let seq = self.next_seq();
+        let seq = next_route_sequence();
         rtmsg.hdr.rtm_type = RTM_GET as u8;
         rtmsg.hdr.rtm_flags = route_flags(route, true);
         apply_ifscope(&mut rtmsg.hdr, route);
@@ -125,150 +98,116 @@ impl RouteAction for RouteSock {
         rtmsg.hdr.rtm_pid = unsafe { libc::getpid() };
         rtmsg.hdr.rtm_msglen = rtmsg.len() as u16;
 
-        self.write_all(route_msg_bytes(&rtmsg))?;
+        self.with_request_loopback(|socket| {
+            socket.write_all(route_msg_bytes(&rtmsg))?;
 
-        let mut buf = [0; std::mem::size_of::<m_rtmsg>()];
-        let n = self.read_request_response_len(&mut buf, seq, RTM_GET as u8)?;
-        let rtmsg: &mut m_rtmsg = unsafe { &mut *(buf.as_mut_ptr() as *mut m_rtmsg) };
-        if rtmsg.hdr.rtm_errno != 0 {
-            return Err(code2error(rtmsg.hdr.rtm_errno));
-        }
-        if rtmsg.hdr.rtm_msglen > n as u16 {
-            return Err(io::Error::other(format!(
-                "message length mismatch, in packet {}, returned {}",
-                rtmsg.hdr.rtm_msglen, n
-            )));
-        }
+            let mut response = socket.read_request_response(seq, RTM_GET as u8)?;
+            if response.hdr.rtm_errno != 0 {
+                return Err(code2error(response.hdr.rtm_errno));
+            }
 
-        read_route(rtmsg, n)
+            read_route(&mut response)
+        })
     }
 
     fn monitor(&mut self, buf: &mut [u8]) -> io::Result<(crate::RouteChange, Route)> {
-        let n = self.read(buf)?;
+        loop {
+            let n = self.read(buf)?;
+            let prefix = message_prefix(&buf[..n])?;
+            if !matches!(
+                prefix.message_type,
+                kind if kind == RTM_ADD as u8
+                    || kind == RTM_DELETE as u8
+                    || kind == RTM_CHANGE as u8
+            ) {
+                continue;
+            }
 
-        let rtmsg: &mut m_rtmsg = unsafe { &mut *(buf.as_mut_ptr() as *mut m_rtmsg) };
-        if rtmsg.hdr.rtm_msglen > n as u16 {
-            return Err(io::Error::other(format!(
-                "message length mismatch, in packet {}, returned {}",
-                rtmsg.hdr.rtm_msglen, n
-            )));
+            let mut rtmsg = m_rtmsg::parse(&buf[..n])?;
+            validate_header(&rtmsg.hdr, None)?;
+            if rtmsg.hdr.rtm_errno != 0 {
+                return Err(code2error(rtmsg.hdr.rtm_errno));
+            }
+
+            let change: RouteChange = rtmsg.hdr.rtm_type.into();
+            return Ok((change, read_route(&mut rtmsg)?));
         }
-        validate_header(&rtmsg.hdr, None)?;
-
-        let rtm_type: RouteChange = rtmsg.hdr.rtm_type.into();
-        Ok((rtm_type, read_route(rtmsg, n)?))
     }
 }
 
 impl RouteSock {
     pub fn new() -> io::Result<Self> {
         let fd = syscall!(socket(AF_ROUTE, SOCK_RAW, AF_UNSPEC))?;
+        let socket = Self { fd };
+        set_route_loopback(fd, false)?;
 
-        Ok(Self { fd, seq: 0 })
+        Ok(socket)
     }
 
     pub fn new_buf() -> [u8; std::mem::size_of::<m_rtmsg>()] {
         m_rtmsg::new_buf()
     }
 
-    fn read_request_response<'a>(
-        &mut self,
-        buf: &'a mut [u8],
-        seq: i32,
-        expected_type: u8,
-    ) -> io::Result<&'a rt_msghdr> {
-        let _ = self.read_request_response_len(buf, seq, expected_type)?;
-        Ok(unsafe { buf.as_ptr().cast::<rt_msghdr>().as_ref().unwrap() })
-    }
-
-    fn read_request_response_timeout<'a>(
-        &mut self,
-        buf: &'a mut [u8],
-        seq: i32,
-        expected_type: u8,
-        timeout: Duration,
-    ) -> io::Result<&'a rt_msghdr> {
-        let _ = self.read_request_response_len_timeout(buf, seq, expected_type, timeout)?;
-        Ok(unsafe { buf.as_ptr().cast::<rt_msghdr>().as_ref().unwrap() })
-    }
-
-    fn read_request_response_len(
-        &mut self,
-        buf: &mut [u8],
-        seq: i32,
-        expected_type: u8,
-    ) -> io::Result<usize> {
+    fn read_request_response(&mut self, seq: i32, expected_type: u8) -> io::Result<m_rtmsg> {
         let pid = unsafe { libc::getpid() };
+        let mut buf = m_rtmsg::new_buf();
         loop {
-            let n = self.read(buf)?;
-            if !response_matches_ours(buf, n, pid, seq) {
+            let n = self.read(&mut buf)?;
+            let prefix = message_prefix(&buf[..n])?;
+            if !matches!(
+                prefix.message_type,
+                kind if kind == RTM_ADD as u8
+                    || kind == RTM_DELETE as u8
+                    || kind == RTM_CHANGE as u8
+                    || kind == RTM_GET as u8
+            ) {
                 continue;
             }
-            let hdr = unsafe { buf.as_ptr().cast::<rt_msghdr>().as_ref().unwrap() };
-            validate_header(hdr, Some(expected_type))?;
-            return Ok(n);
+
+            let rtmsg = m_rtmsg::parse(&buf[..n])?;
+            if rtmsg.hdr.rtm_pid != pid || rtmsg.hdr.rtm_seq != seq {
+                continue;
+            }
+            validate_header(&rtmsg.hdr, Some(expected_type))?;
+            return Ok(rtmsg);
         }
     }
 
-    fn read_request_response_len_timeout(
+    fn with_request_loopback<T>(
         &mut self,
-        buf: &mut [u8],
-        seq: i32,
-        expected_type: u8,
-        timeout: Duration,
-    ) -> io::Result<usize> {
-        let pid = unsafe { libc::getpid() };
-        let deadline = Instant::now() + timeout;
-        loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "routing response timed out",
-                ));
-            }
+        request: impl FnOnce(&mut Self) -> io::Result<T>,
+    ) -> io::Result<T> {
+        set_route_loopback(self.as_raw_fd(), true)?;
+        let result = request(self);
+        let restore = set_route_loopback(self.as_raw_fd(), false);
 
-            let mut pfd = pollfd {
-                fd: self.as_raw_fd(),
-                events: POLLIN,
-                revents: 0,
-            };
-            let timeout_ms = remaining.as_millis().min(i32::MAX as u128) as i32;
-            let ready = syscall!(poll(&mut pfd, 1, timeout_ms))?;
-            if ready == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "routing response timed out",
-                ));
-            }
-
-            let n = self.read(buf)?;
-            if !response_matches_ours(buf, n, pid, seq) {
-                continue;
-            }
-            let hdr = unsafe { buf.as_ptr().cast::<rt_msghdr>().as_ref().unwrap() };
-            validate_header(hdr, Some(expected_type))?;
-            return Ok(n);
+        match (result, restore) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(request_error), Ok(())) => Err(request_error),
+            (Ok(_), Err(restore_error)) => Err(restore_error),
+            (Err(request_error), Err(restore_error)) => Err(io::Error::other(format!(
+                "route request failed: {request_error}; restoring SO_USELOOPBACK also failed: {restore_error}"
+            ))),
         }
-    }
-
-    fn next_seq(&mut self) -> i32 {
-        self.seq = self.seq.wrapping_add(1).max(1);
-        self.seq
     }
 }
 
-/// True only when the message in `buf` is large enough to be a routing
-/// header and carries OUR `(pid, seq)`. Short broadcasts and replies for
-/// other route-socket listeners should make the caller keep reading, not
-/// bail out. Once a message is ours, version/type validation is a real
-/// protocol check and belongs in `validate_header`.
-fn response_matches_ours(buf: &[u8], n: usize, pid: i32, seq: i32) -> bool {
-    if n < std::mem::size_of::<rt_msghdr>() {
-        return false;
+fn next_route_sequence() -> i32 {
+    let previous = ROUTE_SEQUENCE
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |sequence| {
+            Some(if sequence == i32::MAX {
+                1
+            } else {
+                sequence + 1
+            })
+        })
+        .expect("sequence update closure always returns Some");
+
+    if previous == i32::MAX {
+        1
+    } else {
+        previous + 1
     }
-    let hdr = unsafe { &*(buf.as_ptr().cast::<rt_msghdr>()) };
-    hdr.rtm_pid == pid && hdr.rtm_seq == seq
 }
 
 impl Drop for RouteSock {
@@ -361,36 +300,31 @@ fn is_host_route(route: &Route) -> bool {
     }
 }
 
-fn read_route(rtmsg: &mut m_rtmsg, n: usize) -> io::Result<Route> {
+fn read_route(rtmsg: &mut m_rtmsg) -> io::Result<Route> {
     let mut ret = Route::default();
     rtmsg.attr_len = 0;
-
     for offset in 0..RTAX_MAX {
-        if rtmsg.attr_len + std::mem::size_of::<rt_msghdr>() >= n {
-            break;
-        }
         let bit = 1 << offset;
         if rtmsg.hdr.rtm_addrs & bit == 0 {
             continue;
         }
 
         match bit {
-            RTA_DST => ret.destination = rtmsg.get_destination(),
+            RTA_DST => ret.destination = rtmsg.get_destination()?,
             RTA_GATEWAY => {
-                let gateway = rtmsg.get_gateway();
-                ret.gateway = if rtmsg.hdr.rtm_flags & RTF_GATEWAY != 0 {
-                    Some(gateway)
+                if rtmsg.hdr.rtm_flags & RTF_GATEWAY != 0 {
+                    ret.gateway = Some(rtmsg.get_gateway()?);
                 } else {
-                    None
-                };
+                    rtmsg.skip_addr()?;
+                }
             }
             RTA_NETMASK => ret.cidr(rtmsg.get_netmask(if ret.destination.is_ipv4() {
                 AF_INET as u8
             } else {
                 AF_INET6 as u8
-            })),
-            RTA_IFP => ret.ifindex = Some(rtmsg.get_index()),
-            _ => {}
+            })?),
+            RTA_IFP => ret.ifindex = Some(rtmsg.get_index()?),
+            _ => rtmsg.skip_addr()?,
         }
     }
 
@@ -420,34 +354,76 @@ fn validate_header(hdr: &rt_msghdr, expected_type: Option<u8>) -> io::Result<()>
         )));
     }
 
-    if let Some(expected_type) = expected_type {
-        if hdr.rtm_type != expected_type {
-            return Err(io::Error::other(format!(
-                "unexpected routing message type {}",
-                hdr.rtm_type
-            )));
-        }
+    if let Some(expected_type) = expected_type
+        && hdr.rtm_type != expected_type
+    {
+        return Err(io::Error::other(format!(
+            "unexpected routing message type {}",
+            hdr.rtm_type
+        )));
     }
 
     Ok(())
 }
 
-fn code2error(err: i32) -> io::Error {
-    let kind = match err {
-        17 => io::ErrorKind::AlreadyExists, // EEXIST
-        3 => io::ErrorKind::NotFound,       // ESRCH
-        3436 => io::ErrorKind::OutOfMemory, // ENOBUFS
-        _ => io::ErrorKind::Other,
-    };
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MessagePrefix {
+    message_type: u8,
+}
 
-    io::Error::new(kind, format!("rtm_errno {}", err))
+fn message_prefix(bytes: &[u8]) -> io::Result<MessagePrefix> {
+    if bytes.len() < 4 {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "truncated routing message prefix",
+        ));
+    }
+
+    let message_len = u16::from_ne_bytes([bytes[0], bytes[1]]) as usize;
+    if message_len < 4 || message_len > bytes.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "invalid routing message length {message_len} for {} received bytes",
+                bytes.len()
+            ),
+        ));
+    }
+    if bytes[2] != RTM_VERSION as u8 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unexpected routing message version {}", bytes[2]),
+        ));
+    }
+
+    Ok(MessagePrefix {
+        message_type: bytes[3],
+    })
+}
+
+fn code2error(err: i32) -> io::Error {
+    io::Error::from_raw_os_error(err)
+}
+
+fn set_route_loopback(fd: RawFd, enabled: bool) -> io::Result<()> {
+    let enabled = i32::from(enabled);
+    syscall!(setsockopt(
+        fd,
+        SOL_SOCKET,
+        SO_USELOOPBACK,
+        (&enabled as *const i32).cast(),
+        std::mem::size_of_val(&enabled) as _
+    ))?;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use std::net::{IpAddr, Ipv4Addr};
-
-    use libc::sockaddr;
+    use std::{
+        collections::HashSet,
+        net::{IpAddr, Ipv4Addr},
+        time::{Duration, Instant},
+    };
 
     use super::*;
 
@@ -481,9 +457,8 @@ mod tests {
         let route = Route::new(IpAddr::V4(Ipv4Addr::new(1, 9, 4, 5)), 24);
 
         let rtmsg = write_route_addrs(&route, RouteRequestKind::Add);
-        let netmask = unsafe { &*(rtmsg.attr[16..].as_ptr() as *const sockaddr) };
 
-        assert_eq!(netmask.sa_len, 7);
+        assert_eq!(rtmsg.attr[16] as u8, 7);
     }
 
     #[test]
@@ -491,9 +466,8 @@ mod tests {
         let route = Route::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
 
         let rtmsg = write_route_addrs(&route, RouteRequestKind::Add);
-        let netmask = unsafe { &*(rtmsg.attr[16..].as_ptr() as *const sockaddr) };
 
-        assert_eq!(netmask.sa_len, 0);
+        assert_eq!(rtmsg.attr[16] as u8, 0);
         assert_eq!(rtmsg.attr_len, 20);
     }
 
@@ -532,8 +506,9 @@ mod tests {
         // No sockaddr table — RTA bits are all zero, so read_route just
         // sees the scope metadata in the header.
         rtmsg.hdr.rtm_addrs = 0;
+        rtmsg.hdr.rtm_msglen = std::mem::size_of::<rt_msghdr>() as u16;
 
-        let route = read_route(&mut rtmsg, std::mem::size_of::<rt_msghdr>()).unwrap();
+        let route = read_route(&mut rtmsg).unwrap();
         assert_eq!(route.scope_ifindex, Some(11));
     }
 
@@ -543,56 +518,136 @@ mod tests {
         rtmsg.hdr.rtm_flags = 0;
         rtmsg.hdr.rtm_index = 42;
         rtmsg.hdr.rtm_addrs = 0;
+        rtmsg.hdr.rtm_msglen = std::mem::size_of::<rt_msghdr>() as u16;
 
-        let route = read_route(&mut rtmsg, std::mem::size_of::<rt_msghdr>()).unwrap();
+        let route = read_route(&mut rtmsg).unwrap();
         assert_eq!(route.scope_ifindex, None);
     }
 
     #[test]
-    fn response_filter_rejects_short_read_and_mismatch_but_accepts_our_reply() {
-        let mut rtmsg = m_rtmsg::default();
-        rtmsg.hdr.rtm_pid = 42;
-        rtmsg.hdr.rtm_seq = 7;
-        let buf = unsafe {
-            std::slice::from_raw_parts(
-                &rtmsg as *const m_rtmsg as *const u8,
-                std::mem::size_of::<m_rtmsg>(),
-            )
-        };
+    fn route_message_parser_accepts_an_unaligned_slice() {
+        let expected = Route::new(IpAddr::V4(Ipv4Addr::new(10, 20, 30, 0)), 24)
+            .gateway(IpAddr::V4(Ipv4Addr::new(10, 20, 30, 1)));
+        let mut wire = write_route_addrs(&expected, RouteRequestKind::Add);
+        wire.hdr.rtm_flags = RTF_GATEWAY;
+        wire.hdr.rtm_msglen = wire.len() as u16;
 
-        // Short read: not enough bytes for a header — skip.
-        assert!(!response_matches_ours(buf, 4, 42, 7));
-        // Foreign reply (different pid): skip.
-        assert!(!response_matches_ours(
-            buf,
-            std::mem::size_of::<rt_msghdr>(),
-            99,
-            7,
-        ));
-        // Bad version is still OUR reply. Accept it here so validate_header
-        // reports the protocol error instead of looping forever.
-        let mut bad_ver = m_rtmsg::default();
-        bad_ver.hdr.rtm_version = (RTM_VERSION as u8).wrapping_add(1);
-        bad_ver.hdr.rtm_pid = 42;
-        bad_ver.hdr.rtm_seq = 7;
-        let bad_buf = unsafe {
-            std::slice::from_raw_parts(
-                &bad_ver as *const m_rtmsg as *const u8,
-                std::mem::size_of::<rt_msghdr>(),
-            )
-        };
-        assert!(response_matches_ours(
-            bad_buf,
-            std::mem::size_of::<rt_msghdr>(),
-            42,
-            7,
-        ));
-        // Our reply: accept.
-        assert!(response_matches_ours(
-            buf,
-            std::mem::size_of::<rt_msghdr>(),
-            42,
-            7,
-        ));
+        let mut unaligned = vec![0xAA];
+        unaligned.extend_from_slice(route_msg_bytes(&wire));
+        let mut parsed = m_rtmsg::parse(&unaligned[1..]).unwrap();
+
+        let actual = read_route(&mut parsed).unwrap();
+        assert_eq!(actual.destination, expected.destination);
+        assert_eq!(actual.prefix, expected.prefix);
+        assert_eq!(actual.gateway, expected.gateway);
+    }
+
+    #[test]
+    fn route_message_parser_rejects_short_and_inconsistent_lengths() {
+        let short_error = m_rtmsg::parse(&[0; 4]).err().unwrap();
+        assert_eq!(short_error.kind(), io::ErrorKind::UnexpectedEof);
+
+        let mut wire = m_rtmsg::default();
+        wire.hdr.rtm_msglen = (std::mem::size_of::<rt_msghdr>() + 1) as u16;
+        let bytes = &route_msg_bytes(&wire)[..std::mem::size_of::<rt_msghdr>()];
+        let length_error = m_rtmsg::parse(bytes).err().unwrap();
+        assert_eq!(length_error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn route_parser_rejects_a_declared_but_missing_attribute() {
+        let mut message = m_rtmsg::default();
+        message.hdr.rtm_msglen = std::mem::size_of::<rt_msghdr>() as u16;
+        message.hdr.rtm_addrs = RTA_DST;
+
+        let error = read_route(&mut message).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn raw_route_errno_is_preserved() {
+        let error = code2error(libc::ENOBUFS);
+
+        assert_eq!(error.raw_os_error(), Some(libc::ENOBUFS));
+    }
+
+    #[test]
+    fn routing_sequences_are_unique_across_concurrent_callers() {
+        let handles: Vec<_> = (0..32)
+            .map(|_| std::thread::spawn(next_route_sequence))
+            .collect();
+        let sequences: HashSet<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+
+        assert_eq!(sequences.len(), 32);
+        assert!(sequences.iter().all(|sequence| *sequence > 0));
+    }
+
+    #[test]
+    #[ignore = "black-box check against the live macOS routing socket"]
+    fn get_restores_loopback_and_route_messages_are_process_wide() {
+        let mut observer = RouteSock::new().unwrap();
+        let mut socket = RouteSock::new().unwrap();
+
+        socket.get(&Route::default()).unwrap();
+
+        let mut enabled = -1;
+        let mut value_len = std::mem::size_of_val(&enabled) as libc::socklen_t;
+        syscall!(getsockopt(
+            socket.as_raw_fd(),
+            SOL_SOCKET,
+            SO_USELOOPBACK,
+            (&mut enabled as *mut i32).cast(),
+            &mut value_len
+        ))
+        .unwrap();
+        assert_eq!(enabled, 0);
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(!remaining.is_zero(), "observer did not receive the RTM_GET");
+            let mut poll_fd = libc::pollfd {
+                fd: observer.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let timeout_ms = remaining.as_millis().min(i32::MAX as u128) as i32;
+            let ready = syscall!(poll(&mut poll_fd, 1, timeout_ms)).unwrap();
+            assert_ne!(ready, 0, "observer did not receive the RTM_GET");
+
+            let mut buf = RouteSock::new_buf();
+            let n = observer.read(&mut buf).unwrap();
+            let prefix = message_prefix(&buf[..n]).unwrap();
+            if prefix.message_type != RTM_GET as u8 {
+                continue;
+            }
+            let message = m_rtmsg::parse(&buf[..n]).unwrap();
+            if message.hdr.rtm_pid == unsafe { libc::getpid() } {
+                break;
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires root and temporarily installs a reserved test route"]
+    fn mutation_write_reports_duplicate_and_missing_route_errors_without_echo() {
+        let route = Route::new(IpAddr::V4(Ipv4Addr::new(198, 18, 255, 254)), 32)
+            .ifindex(crate::if_nametoindex("lo0").unwrap());
+        let mut socket = RouteSock::new().unwrap();
+
+        socket.add(&route).unwrap();
+        let duplicate = socket.add(&route);
+        let cleanup = socket.delete(&route);
+
+        cleanup.unwrap();
+        assert_eq!(duplicate.unwrap_err().raw_os_error(), Some(libc::EEXIST));
+        assert_eq!(
+            socket.delete(&route).unwrap_err().raw_os_error(),
+            Some(libc::ESRCH)
+        );
     }
 }
