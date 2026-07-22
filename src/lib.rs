@@ -1,6 +1,20 @@
-#![allow(clippy::macro_metavars_in_unsafe)]
-
 use std::{ffi::CString, io, net::IpAddr};
+
+// Keep raw syscalls inside this crate. Exporting a macro that supplies its own
+// `unsafe` block lets downstream safe code pass arbitrary invalid pointers to
+// libc without an unsafe call site.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+macro_rules! syscall {
+    ($fn: ident ( $($arg: expr),* ) ) => {{
+        #[allow(unused_unsafe)]
+        let res = unsafe { libc::$fn($( $arg), *) };
+        if res < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(res)
+        }
+    }};
+}
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -15,20 +29,6 @@ pub use linux::RouteSock;
 pub use macos::RouteSock;
 #[cfg(target_os = "windows")]
 pub use windows::RouteSock;
-
-#[macro_export]
-#[allow(clippy::macro_metavars_in_unsafe)]
-macro_rules! syscall {
-    ($fn: ident ( $($arg: expr),* ) ) => {{
-        #[allow(unused_unsafe)]
-        let res = unsafe { libc::$fn($( $arg), *) };
-        if res < 0 {
-            Err(std::io::Error::last_os_error())
-        } else {
-            Ok(res)
-        }
-    }};
-}
 
 #[derive(Debug, Clone)]
 pub struct Route {
@@ -107,16 +107,16 @@ impl Route {
             ));
         }
 
-        if let Some(gateway) = self.gateway {
-            if std::mem::discriminant(&self.destination) != std::mem::discriminant(&gateway) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!(
-                        "gateway {gateway} does not match destination {}",
-                        self.destination
-                    ),
-                ));
-            }
+        if let Some(gateway) = self.gateway
+            && std::mem::discriminant(&self.destination) != std::mem::discriminant(&gateway)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "gateway {gateway} does not match destination {}",
+                    self.destination
+                ),
+            ));
         }
 
         Ok(())

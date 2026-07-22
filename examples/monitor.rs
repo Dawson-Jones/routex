@@ -11,20 +11,11 @@ fn main() {
     loop {
         let ret = handle.monitor(&mut buf).unwrap();
         println!("{:?}", ret);
-        match ret.0 {
-            routex::RouteChange::ADD => {
-                let route = ret.1;
-                if route.destination.is_unspecified() {
-                    println!("default route added: {:?}", route);
-                }
+        if let routex::RouteChange::ADD = ret.0 {
+            let route = ret.1;
+            if route.destination.is_unspecified() {
+                println!("default route added: {:?}", route);
             }
-            routex::RouteChange::OTHER(0xc) /* RTM_NEWADDR */ => {
-                let route = ret.1;
-                if route.destination.is_unspecified() {
-                    println!("default addr added: {:?}", route);
-                }
-            },
-            _ => ()
         }
     }
 }
